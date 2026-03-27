@@ -26,8 +26,10 @@ MQTT_CLIENT_ID = "hmpd_bridge"
 MQTT_KEEPALIVE = 60
 MQTT_RETRY_SECONDS = 10
 
+# Your original script already used both usb0 and usb1. :contentReference[oaicite:0]{index=0}
 CONTROLLERS = [
     {"name": "usb0", "dev": "/dev/ttyUSB0", "baud": 4800},
+    {"name": "usb1", "dev": "/dev/ttyUSB1", "baud": 4800},
 ]
 
 POLL_INTERVAL = 10
@@ -39,7 +41,6 @@ TEMP_MAX = 32.0
 TEMP_STEP = 0.1
 
 # Current-temperature sanity filter for deciding whether a thermostat exists at all.
-# User asked to remove entities entirely when current temp is nonsense.
 CURRENT_TEMP_MIN = 0.0
 CURRENT_TEMP_MAX = 100.0
 
@@ -339,7 +340,6 @@ class HMPDBridge:
 
                 enabled = "EN" in parts[4]
 
-                # If current temperature is nonsense, the thermostat must not exist.
                 if current_temp is None or not self.valid_current_temp(current_temp):
                     if DEBUG:
                         log.debug(
@@ -466,7 +466,6 @@ class HMPDBridge:
         log.info("Published discovery for %s", zone.zone_name)
 
     def publish_state(self, zone: Zone) -> None:
-        # Never publish a thermostat without a valid current temperature.
         if zone.current_temp is None or not self.valid_current_temp(zone.current_temp):
             self.remove_zone(zone.unique_id)
             return
@@ -497,7 +496,6 @@ class HMPDBridge:
         lines = self.run_hmpd(controller, ["temps"])
         temps = self.parse_temps(controller, lines)
 
-        # If a zone has no valid temp in temps output, remove it completely.
         valid_temp_ids = {
             f"{self.slugify(controller.name)}_{idx}"
             for idx in temps.keys()
