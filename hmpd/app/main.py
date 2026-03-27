@@ -34,6 +34,7 @@ POLL_INTERVAL = 10
 REG_REFRESH_INTERVAL = 300
 TEMPS_TIMEOUT = 15
 REGS_TIMEOUT = 20
+SET_TIMEOUT = 8
 
 TEMP_MIN = 16.0
 TEMP_MAX = 32.0
@@ -110,7 +111,6 @@ class Zone:
     target_temp: Optional[float] = None
     enabled: Optional[bool] = None
     discovered: bool = False
-    from_regs: bool = False
 
 
 class HMPDBridge:
@@ -129,6 +129,7 @@ class HMPDBridge:
         self.reg_refresh_interval = REG_REFRESH_INTERVAL
         self.temps_timeout = TEMPS_TIMEOUT
         self.regs_timeout = REGS_TIMEOUT
+        self.set_timeout = SET_TIMEOUT
         self.temp_min = TEMP_MIN
         self.temp_max = TEMP_MAX
         self.temp_step = TEMP_STEP
@@ -169,43 +170,6 @@ class HMPDBridge:
 
     def zone_unique_id(self, controller_name: str, zone_index: int) -> str:
         return f"{self.slugify(controller_name)}_{int(zone_index)}"
-
-    def default_zone_name(self, controller_name: str, zone_index: int) -> str:
-        return f"{controller_name.upper()} Zone {int(zone_index)}"
-
-    def get_or_create_zone(
-        self,
-        controller: Controller,
-        zone_index: int,
-        zone_name: Optional[str] = None,
-    ) -> Zone:
-        unique_id = self.zone_unique_id(controller.name, zone_index)
-        zone = self.zones.get(unique_id)
-        if zone is None:
-            zone = Zone(
-                controller_name=controller.name,
-                controller_dev=controller.dev,
-                zone_index=int(zone_index),
-                zone_name=zone_name or self.default_zone_name(controller.name, zone_index),
-                unique_id=unique_id,
-            )
-            self.zones[unique_id] = zone
-            if DEBUG:
-                log.debug(
-                    "Created placeholder zone [%s] idx=%s unique_id=%s name=%s",
-                    controller.name,
-                    zone_index,
-                    unique_id,
-                    zone.zone_name,
-                )
-        else:
-            zone.controller_name = controller.name
-            zone.controller_dev = controller.dev
-            zone.zone_index = int(zone_index)
-            if zone_name:
-                zone.zone_name = zone_name
-
-        return zone
 
     def hmpd_candidates(self) -> List[str]:
         candidates = [
@@ -294,29 +258,32 @@ class HMPDBridge:
         if DEBUG:
             log.debug("MQTT message: %s => %s", topic, payload)
 
-        if topic == f"{self.base_topic}/bridge/resync":
-            self.sync_all_regs()
-            self.sync_all_temps()
-            return
-
-        m = re.match(rf"^{re.escape(self.base_topic)}/([^/]+)/set_target$", topic)
-        if not m:
-            return
-
-        zone_key = m.group(1)
-        zone = self.zones.get(zone_key)
-        if not zone:
-            log.warning("Unknown zone key from MQTT: %s", zone_key)
-            return
-
         try:
-            value = float(payload)
-        except ValueError:
-            log.warning("Invalid target payload for %s: %s", zone_key, payload)
-            return
+            if topic == f"{self.base_topic}/bridge/resync":
+                self.sync_all_regs()
+                self.sync_all_temps()
+                return
 
-        value = round(max(self.temp_min, min(self.temp_max, value)), 1)
-        self.set_zone_target(zone, value)
+            m = re.match(rf"^{re.escape(self.base_topic)}/([^/]+)/set_target$", topic)
+            if not m:
+                return
+
+            zone_key = m.group(1)
+            zone = self.zones.get(zone_key)
+            if not zone:
+                log.warning("Unknown zone key from MQTT: %s", zone_key)
+                return
+
+            try:
+                value = float(payload)
+            except ValueError:
+                log.warning("Invalid target payload for %s: %s", zone_key, payload)
+                return
+
+            value = round(max(self.temp_min, min(self.temp_max, value)), 1)
+            self.set_zone_target(zone, value)
+        except Exception as exc:
+            log.error("MQTT message handling failed for topic %s: %s", topic, exc)
 
     def build_hmpd_cmd(self, controller: Controller, action_args: List[str]) -> List[str]:
         hmpd = self.ensure_hmpd()
@@ -390,7 +357,7 @@ class HMPDBridge:
                 idx = int(parts[0])
                 name = parts[1].strip()
                 if not name:
-                    name = self.default_zone_name(controller.name, idx)
+                    continue
 
                 m_cur = re.search(r"cur:\s*(-?\d+(?:\.\d+)?)", parts[2])
                 m_tgt = re.search(r"tgt:\s*(-?\d+(?:\.\d+)?)", parts[3])
@@ -409,7 +376,6 @@ class HMPDBridge:
                     )
 
                 enabled = "EN" in parts[4]
-
                 unique = self.zone_unique_id(controller.name, idx)
                 prev = self.zones.get(unique)
 
@@ -423,7 +389,6 @@ class HMPDBridge:
                     target_temp=target_temp if target_temp is not None else (prev.target_temp if prev else None),
                     enabled=enabled,
                     discovered=prev.discovered if prev else False,
-                    from_regs=True,
                 )
                 zones.append(zone)
 
@@ -484,7 +449,7 @@ class HMPDBridge:
         to_remove = [
             unique_id
             for unique_id, zone in self.zones.items()
-            if zone.controller_name == controller.name and zone.from_regs and unique_id not in valid_ids
+            if zone.controller_name == controller.name and unique_id not in valid_ids
         ]
         for unique_id in to_remove:
             self.remove_zone(unique_id)
@@ -524,12 +489,9 @@ class HMPDBridge:
         log.info("Published discovery for %s", zone.zone_name)
 
     def publish_state(self, zone: Zone) -> None:
-        if zone.current_temp is None or not self.valid_current_temp(zone.current_temp):
-            return
-
         topic = f"{self.base_topic}/{zone.unique_id}/state"
         payload = {
-            "current_temp": zone.current_temp,
+            "current_temp": zone.current_temp if zone.current_temp is not None else self.temp_min,
             "target_temp": zone.target_temp if zone.target_temp is not None else self.temp_min,
             "mode": "heat",
         }
@@ -561,30 +523,15 @@ class HMPDBridge:
         temps = self.parse_temps(controller, lines)
 
         updated = 0
-        created = 0
+        for zone in list(self.zones.values()):
+            if zone.controller_name != controller.name:
+                continue
+            if zone.zone_index in temps:
+                zone.current_temp = temps[zone.zone_index]
+                self.publish_state(zone)
+                updated += 1
 
-        for idx, current_temp in temps.items():
-            unique_id = self.zone_unique_id(controller.name, idx)
-            zone = self.zones.get(unique_id)
-
-            if zone is None:
-                zone = self.get_or_create_zone(controller, idx)
-                created += 1
-
-            zone.current_temp = current_temp
-
-            if not zone.discovered:
-                self.publish_discovery(zone)
-
-            self.publish_state(zone)
-            updated += 1
-
-        log.info(
-            "Synced %s temperatures for controller %s (%s created)",
-            updated,
-            controller.name,
-            created,
-        )
+        log.info("Synced %s temperatures for controller %s", updated, controller.name)
 
     def sync_all_regs(self) -> None:
         for controller in self.controllers:
@@ -603,12 +550,26 @@ class HMPDBridge:
     def set_zone_target(self, zone: Zone, target: float) -> None:
         controller = self.controllers_by_name.get(zone.controller_name)
         if controller is None:
-            raise RuntimeError(f"Unknown controller for zone {zone.unique_id}: {zone.controller_name}")
+            log.error("Unknown controller for zone %s", zone.unique_id)
+            return
 
-        self.run_hmpd(controller, ["set", str(zone.zone_index), f"{target:.1f}"], timeout=self.temps_timeout)
-        zone.target_temp = target
-        self.publish_state(zone)
-        log.info("Set %s (%s) to %.1f", zone.zone_name, zone.unique_id, target)
+        try:
+            self.run_hmpd(
+                controller,
+                ["set", str(zone.zone_index), f"{target:.1f}"],
+                timeout=self.set_timeout,
+            )
+            zone.target_temp = target
+            self.publish_state(zone)
+            log.info("Set %s (%s) to %.1f", zone.zone_name, zone.unique_id, target)
+        except Exception as exc:
+            log.error(
+                "Failed to set %s (%s) to %.1f: %s",
+                zone.zone_name,
+                zone.unique_id,
+                target,
+                exc,
+            )
 
     def start(self):
         self.find_hmpd()
