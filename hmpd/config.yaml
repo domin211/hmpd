@@ -35,18 +35,18 @@ options:
       baud: 4800
   poll_interval: 10
   reg_refresh_interval: 300
-  command_timeout: 15
+  command_timeout: 60
   temp_min: 10.0
   temp_max: 35.5
   temp_step: 0.1
   hmpd_path: /homeassistant/hmpd
   retain_discovery: true
   retain_state: true
-  log_level: info
-  debug_raw_output: false
+  log_level: debug
+  debug_raw_output: true
   debug_save_log_file: true
   debug_log_file: /config/hmpd_bridge.log
-  debug_dump_parsed_data: false
+  debug_dump_parsed_data: true
 
 schema:
   mqtt_host: str
