@@ -167,6 +167,7 @@ class HMPDBridge:
         while True:
             try:
                 log.info("Connecting to MQTT broker %s:%s", self.mqtt_host, self.mqtt_port)
+                self.mqtt_connected = False
                 self.mqtt.connect(self.mqtt_host, self.mqtt_port, keepalive=self.mqtt_keepalive)
                 self.mqtt.loop_start()
 
@@ -177,8 +178,9 @@ class HMPDBridge:
                     time.sleep(0.2)
 
                 log.error("MQTT connect timed out")
+                self.mqtt.loop_stop()
                 try:
-                    self.mqtt.loop_stop()
+                    self.mqtt.disconnect()
                 except Exception:
                     pass
             except Exception as exc:
@@ -187,12 +189,9 @@ class HMPDBridge:
             time.sleep(self.mqtt_retry_seconds)
 
     def on_connect(self, client, userdata, flags, reason_code, properties):
-        try:
-            rc_int = int(reason_code)
-        except Exception:
-            rc_int = -1
+        reason_text = str(reason_code)
 
-        if rc_int == 0:
+        if reason_text == "Success":
             self.mqtt_connected = True
             log.info("Connected to MQTT broker %s:%s", self.mqtt_host, self.mqtt_port)
             client.publish(f"{self.base_topic}/bridge/status", "online", qos=1, retain=True)
@@ -200,7 +199,7 @@ class HMPDBridge:
             client.subscribe(f"{self.base_topic}/bridge/resync")
         else:
             self.mqtt_connected = False
-            log.error("MQTT authorization/connection failed: %s", reason_code)
+            log.error("MQTT authorization/connection failed: %s", reason_text)
 
     def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
         self.mqtt_connected = False
@@ -304,8 +303,10 @@ class HMPDBridge:
             zones.append(zone)
 
             if DEBUG_DUMP:
-                log.debug("REG parsed [%s] => idx=%s name=%s target=%s raw=%s",
-                          controller.name, idx + 1, name, target, original)
+                log.debug(
+                    "REG parsed [%s] => idx=%s name=%s target=%s raw=%s",
+                    controller.name, idx + 1, name, target, original
+                )
 
         return zones
 
@@ -335,8 +336,10 @@ class HMPDBridge:
             parsed[zone_idx] = value
 
             if DEBUG_DUMP:
-                log.debug("TEMP parsed [%s] => idx=%s temp=%s raw=%s",
-                          controller.name, zone_idx, value, original)
+                log.debug(
+                    "TEMP parsed [%s] => idx=%s temp=%s raw=%s",
+                    controller.name, zone_idx, value, original
+                )
 
             zone_idx += 1
 
