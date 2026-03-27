@@ -38,6 +38,11 @@ TEMP_MIN = 16.0
 TEMP_MAX = 32.0
 TEMP_STEP = 0.1
 
+# Current-temperature sanity filter for deciding whether a thermostat exists at all.
+# User asked to remove entities entirely when current temp is nonsense.
+CURRENT_TEMP_MIN = 0.0
+CURRENT_TEMP_MAX = 100.0
+
 HMPD_PATH = "/homeassistant/hmpd"
 
 RETAIN_DISCOVERY = True
@@ -304,7 +309,7 @@ class HMPDBridge:
         return [line.strip() for line in stdout.splitlines() if line.strip()]
 
     def valid_current_temp(self, value: float) -> bool:
-        return 0.0 <= value <= 100.0
+        return CURRENT_TEMP_MIN <= value <= CURRENT_TEMP_MAX
 
     def parse_regs(self, controller: Controller, lines: List[str]) -> List[Zone]:
         zones: List[Zone] = []
@@ -334,11 +339,11 @@ class HMPDBridge:
 
                 enabled = "EN" in parts[4]
 
-                # Keep only sane zones with a real current temperature.
+                # If current temperature is nonsense, the thermostat must not exist.
                 if current_temp is None or not self.valid_current_temp(current_temp):
                     if DEBUG:
                         log.debug(
-                            "Skipping nonsensical zone [%s] idx=%s name=%s cur=%s raw=%s",
+                            "Skipping zone with invalid current temp [%s] idx=%s name=%s cur=%s raw=%s",
                             controller.name, idx, name, current_temp, original
                         )
                     continue
@@ -407,6 +412,15 @@ class HMPDBridge:
 
         return parsed
 
+    def remove_zone(self, unique_id: str) -> None:
+        discovery_topic = f"{self.discovery_prefix}/climate/hmpd_{unique_id}/config"
+        state_topic = f"{self.base_topic}/{unique_id}/state"
+        self.mqtt.publish(discovery_topic, "", qos=1, retain=True)
+        self.mqtt.publish(state_topic, "", qos=1, retain=True)
+        if unique_id in self.zones:
+            del self.zones[unique_id]
+        log.info("Removed thermostat %s", unique_id)
+
     def remove_stale_zones_for_controller(self, controller: Controller, valid_ids: set[str]) -> None:
         to_remove = [
             unique_id
@@ -415,10 +429,7 @@ class HMPDBridge:
         ]
 
         for unique_id in to_remove:
-            discovery_topic = f"{self.discovery_prefix}/climate/hmpd_{unique_id}/config"
-            self.mqtt.publish(discovery_topic, "", qos=1, retain=True)
-            del self.zones[unique_id]
-            log.info("Removed stale discovery for %s", unique_id)
+            self.remove_zone(unique_id)
 
     def discovery_payload(self, zone: Zone) -> dict:
         state_topic = f"{self.base_topic}/{zone.unique_id}/state"
@@ -455,6 +466,11 @@ class HMPDBridge:
         log.info("Published discovery for %s", zone.zone_name)
 
     def publish_state(self, zone: Zone) -> None:
+        # Never publish a thermostat without a valid current temperature.
+        if zone.current_temp is None or not self.valid_current_temp(zone.current_temp):
+            self.remove_zone(zone.unique_id)
+            return
+
         topic = f"{self.base_topic}/{zone.unique_id}/state"
         payload = {
             "current_temp": zone.current_temp,
@@ -481,8 +497,22 @@ class HMPDBridge:
         lines = self.run_hmpd(controller, ["temps"])
         temps = self.parse_temps(controller, lines)
 
+        # If a zone has no valid temp in temps output, remove it completely.
+        valid_temp_ids = {
+            f"{self.slugify(controller.name)}_{idx}"
+            for idx in temps.keys()
+        }
+
+        to_remove = [
+            unique_id
+            for unique_id, zone in self.zones.items()
+            if zone.controller_name == controller.name and unique_id not in valid_temp_ids
+        ]
+        for unique_id in to_remove:
+            self.remove_zone(unique_id)
+
         updated = 0
-        for zone in self.zones.values():
+        for zone in list(self.zones.values()):
             if zone.controller_name != controller.name:
                 continue
             if zone.zone_index in temps:
