@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -74,6 +75,7 @@ class Zone:
     unique_id: str
     current_temp: Optional[float] = None
     target_temp: Optional[float] = None
+    enabled: Optional[bool] = None
     discovered: bool = False
 
 
@@ -92,7 +94,7 @@ class HMPDBridge:
 
         self.poll_interval = int(options.get("poll_interval", 10))
         self.reg_refresh_interval = int(options.get("reg_refresh_interval", 300))
-        self.command_timeout = int(options.get("command_timeout", 15))
+        self.command_timeout = int(options.get("command_timeout", 60))
         self.temp_min = float(options.get("temp_min", 10.0))
         self.temp_max = float(options.get("temp_max", 35.5))
         self.temp_step = float(options.get("temp_step", 0.1))
@@ -127,6 +129,7 @@ class HMPDBridge:
         self.mqtt.will_set(f"{self.base_topic}/bridge/status", payload="offline", qos=1, retain=True)
 
         self.hmpd_path = ""
+        self.stdbuf_path = shutil.which("stdbuf")
 
     def slugify(self, value: str) -> str:
         value = value.strip().lower()
@@ -208,7 +211,6 @@ class HMPDBridge:
 
     def on_connect(self, client, userdata, flags, reason_code, properties):
         reason_text = str(reason_code)
-
         if reason_text == "Success":
             self.mqtt_connected = True
             log.info("Connected to MQTT broker %s:%s", self.mqtt_host, self.mqtt_port)
@@ -252,14 +254,15 @@ class HMPDBridge:
         value = max(self.temp_min, min(self.temp_max, value))
         self.set_zone_target(zone, value)
 
-    def run_hmpd(self, controller: Controller, action_args: List[str]) -> List[str]:
+    def build_hmpd_cmd(self, controller: Controller, action_args: List[str]) -> List[str]:
         hmpd = self.ensure_hmpd()
-        cmd = [
-            hmpd,
-            "--dev", controller.dev,
-            "--baud", str(controller.baud),
-            *action_args,
-        ]
+        base = [hmpd, "--dev", controller.dev, "--baud", str(controller.baud), *action_args]
+        if self.stdbuf_path:
+            return [self.stdbuf_path, "-oL", *base]
+        return base
+
+    def run_hmpd(self, controller: Controller, action_args: List[str]) -> List[str]:
+        cmd = self.build_hmpd_cmd(controller, action_args)
         if DEBUG_RAW:
             log.debug("Running: %s", shlex.join(cmd))
 
@@ -273,20 +276,9 @@ class HMPDBridge:
                     check=False,
                 )
         except FileNotFoundError as exc:
-            candidates = ", ".join(self.hmpd_candidates())
-            raise RuntimeError(
-                f"Could not execute hmpd at {hmpd}. "
-                f"The file may exist but still fail with ENOENT if it is built for the wrong CPU "
-                f"architecture or needs a missing dynamic loader/library inside the add-on container. "
-                f"Checked candidates: {candidates}. Original error: {exc}"
-            ) from exc
+            raise RuntimeError(f"Could not execute hmpd command: {exc}") from exc
         except OSError as exc:
-            candidates = ", ".join(self.hmpd_candidates())
-            raise RuntimeError(
-                f"Could not execute hmpd at {hmpd}. "
-                f"This usually means wrong CPU architecture, missing shared libraries, or invalid executable format. "
-                f"Checked candidates: {candidates}. Original error: {exc}"
-            ) from exc
+            raise RuntimeError(f"Could not execute hmpd command: {exc}") from exc
 
         stdout = (proc.stdout or "").replace("\r", "")
         stderr = (proc.stderr or "").replace("\r", "")
@@ -301,82 +293,82 @@ class HMPDBridge:
 
         return [line.strip() for line in stdout.splitlines() if line.strip()]
 
+    def valid_temp(self, value: float) -> bool:
+        return 5.0 < value < 50.0
+
     def parse_regs(self, controller: Controller, lines: List[str]) -> List[Zone]:
         zones: List[Zone] = []
 
-        for idx, line in enumerate(lines):
+        for line in lines:
             original = line
-            line = re.sub(r"\s+", " ", line).strip()
+            try:
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) < 5:
+                    continue
 
-            target = None
-            m_temp = re.search(r"(-?\d+(?:\.\d+)?)", line)
-            if m_temp:
+                idx = int(parts[0])
+                name = parts[1].strip()
+                if not name:
+                    continue
+
+                target = None
                 try:
-                    target = float(m_temp.group(1))
+                    target = float(parts[3].split(":", 1)[1].strip())
                 except Exception:
                     target = None
 
-            name = line
-            if m_temp:
-                name = (line[:m_temp.start()] + line[m_temp.end():]).strip(" :-\t")
-            if not name:
-                name = f"Zone {idx + 1}"
+                enabled = "EN" in parts[4]
 
-            unique = f"{self.slugify(controller.name)}_{idx + 1}"
-            zone = self.zones.get(unique)
-            if zone is None:
-                zone = Zone(
-                    controller_name=controller.name,
-                    controller_dev=controller.dev,
-                    zone_index=idx + 1,
-                    zone_name=name,
-                    unique_id=unique,
-                )
-            zone.zone_name = name
-            if target is not None:
-                zone.target_temp = target
-            zones.append(zone)
+                unique = f"{self.slugify(controller.name)}_{idx}"
+                zone = self.zones.get(unique)
+                if zone is None:
+                    zone = Zone(
+                        controller_name=controller.name,
+                        controller_dev=controller.dev,
+                        zone_index=idx,
+                        zone_name=name,
+                        unique_id=unique,
+                    )
 
-            if DEBUG_DUMP:
-                log.debug(
-                    "REG parsed [%s] => idx=%s name=%s target=%s raw=%s",
-                    controller.name, idx + 1, name, target, original
-                )
+                zone.zone_name = name
+                zone.enabled = enabled
+                if target is not None:
+                    zone.target_temp = target
+
+                zones.append(zone)
+
+                if DEBUG_DUMP:
+                    log.debug(
+                        "REG parsed [%s] => idx=%s name=%s target=%s enabled=%s raw=%s",
+                        controller.name, idx, name, target, enabled, original
+                    )
+            except Exception as exc:
+                log.error("REG parse error [%s]: %s | raw=%s", controller.name, exc, original)
 
         return zones
 
     def parse_temps(self, controller: Controller, lines: List[str]) -> Dict[int, float]:
         parsed: Dict[int, float] = {}
-        zone_idx = 1
 
         for line in lines:
             original = line
-            line = re.sub(r"\s+", " ", line).strip()
+            try:
+                idx_str, val_str = line.split(":", 1)
+                idx = int(idx_str.strip())
+                val = float(val_str.strip())
 
-            matches = re.findall(r"(-?\d+(?:\.\d+)?)", line)
-            if not matches:
-                continue
-
-            value = None
-            for candidate in reversed(matches):
-                try:
-                    value = float(candidate)
-                    break
-                except Exception:
+                if not self.valid_temp(val):
                     continue
 
-            if value is None:
-                continue
+                parsed[idx] = round(val, 1)
 
-            parsed[zone_idx] = value
-
-            if DEBUG_DUMP:
-                log.debug(
-                    "TEMP parsed [%s] => idx=%s temp=%s raw=%s",
-                    controller.name, zone_idx, value, original
-                )
-
-            zone_idx += 1
+                if DEBUG_DUMP:
+                    log.debug(
+                        "TEMP parsed [%s] => idx=%s temp=%s raw=%s",
+                        controller.name, idx, round(val, 1), original
+                    )
+            except Exception as exc:
+                log.error("TEMP parse error [%s]: %s | raw=%s", controller.name, exc, original)
 
         return parsed
 
@@ -419,11 +411,12 @@ class HMPDBridge:
         log.info("Published discovery for %s", zone.zone_name)
 
     def publish_state(self, zone: Zone) -> None:
+        mode = "heat" if zone.enabled is not False else "off"
         topic = f"{self.base_topic}/{zone.unique_id}/state"
         payload = {
             "current_temp": zone.current_temp,
             "target_temp": zone.target_temp,
-            "mode": "heat",
+            "mode": mode,
         }
         self.mqtt.publish(topic, json.dumps(payload), qos=1, retain=self.retain_state)
 
@@ -437,7 +430,7 @@ class HMPDBridge:
                 self.publish_discovery(zone)
             self.publish_state(zone)
 
-        log.info("Synced %s zones from regs for controller %s", len(zones), controller.name)
+        log.info("Synced %s named zones from regs for controller %s", len(zones), controller.name)
 
     def sync_temps(self, controller: Controller) -> None:
         lines = self.run_hmpd(controller, ["temps"])
