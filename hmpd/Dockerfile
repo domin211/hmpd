@@ -4,7 +4,13 @@ FROM $BUILD_FROM
 ENV LANG=C.UTF-8
 ENV PYTHONUNBUFFERED=1
 
-RUN apk add --no-cache python3 py3-pip
+RUN apk add --no-cache \
+    python3 \
+    py3-pip \
+    libstdc++ \
+    libc6-compat \
+    gcompat \
+    file
 
 WORKDIR /app
 COPY app/ /app/
