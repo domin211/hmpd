@@ -15,29 +15,58 @@ import paho.mqtt.client as mqtt
 
 OPTIONS_PATH = "/data/options.json"
 
+# Hardcoded config
+MQTT_HOST = "core-mosquitto"
+MQTT_PORT = 1883
+MQTT_USERNAME = "ufandy"
+MQTT_PASSWORD = "Fanda18067"
+MQTT_DISCOVERY_PREFIX = "homeassistant"
+MQTT_BASE_TOPIC = "hmpd"
+MQTT_CLIENT_ID = "hmpd_bridge"
+MQTT_KEEPALIVE = 60
+MQTT_RETRY_SECONDS = 10
+
+CONTROLLERS = [
+    {"name": "usb0", "dev": "/dev/ttyUSB0", "baud": 4800},
+]
+
+POLL_INTERVAL = 10
+REG_REFRESH_INTERVAL = 300
+COMMAND_TIMEOUT = 60
+
+TEMP_MIN = 16.0
+TEMP_MAX = 32.0
+TEMP_STEP = 0.1
+
+HMPD_PATH = "/homeassistant/hmpd"
+
+RETAIN_DISCOVERY = True
+RETAIN_STATE = True
+
+DEBUG_LOG_FILE = "/config/hmpd_bridge.log"
+
 
 def load_options() -> dict:
-    with open(OPTIONS_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(OPTIONS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"debug": False}
 
 
 OPTIONS = load_options()
+DEBUG = bool(OPTIONS.get("debug", False))
+LOG_LEVEL = logging.DEBUG if DEBUG else logging.INFO
 
-LOG_LEVEL = getattr(logging, str(OPTIONS.get("log_level", "INFO")).upper(), logging.INFO)
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("hmpd_bridge")
 
-DEBUG_RAW = bool(OPTIONS.get("debug_raw_output", False))
-DEBUG_DUMP = bool(OPTIONS.get("debug_dump_parsed_data", False))
-DEBUG_SAVE = bool(OPTIONS.get("debug_save_log_file", True))
-DEBUG_LOG_FILE = OPTIONS.get("debug_log_file", "/config/hmpd_bridge.log")
-
 
 def append_debug_file(message: str) -> None:
-    if not DEBUG_SAVE:
+    if not DEBUG:
         return
     try:
         os.makedirs(os.path.dirname(DEBUG_LOG_FILE), exist_ok=True)
@@ -52,7 +81,7 @@ class FileLoggerHandler(logging.Handler):
         append_debug_file(self.format(record))
 
 
-if DEBUG_SAVE:
+if DEBUG:
     fh = FileLoggerHandler()
     fh.setLevel(LOG_LEVEL)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -80,37 +109,35 @@ class Zone:
 
 
 class HMPDBridge:
-    def __init__(self, options: dict):
-        self.options = options
-        self.discovery_prefix = options.get("mqtt_discovery_prefix", "homeassistant").strip("/")
-        self.base_topic = options.get("mqtt_base_topic", "hmpd").strip("/")
-        self.mqtt_host = options.get("mqtt_host", "")
-        self.mqtt_port = int(options.get("mqtt_port", 1883))
-        self.mqtt_username = options.get("mqtt_username", "")
-        self.mqtt_password = options.get("mqtt_password", "")
-        self.mqtt_client_id = options.get("mqtt_client_id", "hmpd_bridge")
-        self.mqtt_keepalive = int(options.get("mqtt_keepalive", 60))
-        self.mqtt_retry_seconds = int(options.get("mqtt_retry_seconds", 10))
+    def __init__(self):
+        self.discovery_prefix = MQTT_DISCOVERY_PREFIX
+        self.base_topic = MQTT_BASE_TOPIC
+        self.mqtt_host = MQTT_HOST
+        self.mqtt_port = MQTT_PORT
+        self.mqtt_username = MQTT_USERNAME
+        self.mqtt_password = MQTT_PASSWORD
+        self.mqtt_client_id = MQTT_CLIENT_ID
+        self.mqtt_keepalive = MQTT_KEEPALIVE
+        self.mqtt_retry_seconds = MQTT_RETRY_SECONDS
 
-        self.poll_interval = int(options.get("poll_interval", 10))
-        self.reg_refresh_interval = int(options.get("reg_refresh_interval", 300))
-        self.command_timeout = int(options.get("command_timeout", 60))
-        self.temp_min = float(options.get("temp_min", 10.0))
-        self.temp_max = float(options.get("temp_max", 35.5))
-        self.temp_step = float(options.get("temp_step", 0.1))
-        self.retain_discovery = bool(options.get("retain_discovery", True))
-        self.retain_state = bool(options.get("retain_state", True))
-        self.configured_hmpd_path = str(options.get("hmpd_path", "")).strip()
+        self.poll_interval = POLL_INTERVAL
+        self.reg_refresh_interval = REG_REFRESH_INTERVAL
+        self.command_timeout = COMMAND_TIMEOUT
+        self.temp_min = TEMP_MIN
+        self.temp_max = TEMP_MAX
+        self.temp_step = TEMP_STEP
+        self.retain_discovery = RETAIN_DISCOVERY
+        self.retain_state = RETAIN_STATE
+        self.configured_hmpd_path = HMPD_PATH
 
-        self.controllers: List[Controller] = []
-        for item in options.get("controllers", []):
-            self.controllers.append(
-                Controller(
-                    name=item["name"],
-                    dev=item["dev"],
-                    baud=int(item["baud"]),
-                )
+        self.controllers: List[Controller] = [
+            Controller(
+                name=item["name"],
+                dev=item["dev"],
+                baud=int(item["baud"]),
             )
+            for item in CONTROLLERS
+        ]
 
         self.zones: Dict[str, Zone] = {}
         self.command_lock = threading.Lock()
@@ -121,12 +148,10 @@ class HMPDBridge:
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id=self.mqtt_client_id,
         )
-        if self.mqtt_username:
-            self.mqtt.username_pw_set(self.mqtt_username, self.mqtt_password)
+        self.mqtt.username_pw_set(self.mqtt_username, self.mqtt_password)
         self.mqtt.on_connect = self.on_connect
         self.mqtt.on_disconnect = self.on_disconnect
         self.mqtt.on_message = self.on_message
-        self.mqtt.will_set(f"{self.base_topic}/bridge/status", payload="offline", qos=1, retain=True)
 
         self.hmpd_path = ""
         self.stdbuf_path = shutil.which("stdbuf")
@@ -138,20 +163,18 @@ class HMPDBridge:
         return value or "zone"
 
     def hmpd_candidates(self) -> List[str]:
-        candidates: List[str] = []
-        if self.configured_hmpd_path:
-            candidates.append(self.configured_hmpd_path)
-        candidates.extend([
+        candidates = [
+            self.configured_hmpd_path,
             "/homeassistant/hmpd",
             "/config/hmpd",
             "/ha_config/hmpd",
             "/app/hmpd",
             "./hmpd",
-        ])
+        ]
         seen = set()
         ordered: List[str] = []
         for path in candidates:
-            if path not in seen:
+            if path and path not in seen:
                 ordered.append(path)
                 seen.add(path)
         return ordered
@@ -176,13 +199,9 @@ class HMPDBridge:
         raise FileNotFoundError(msg)
 
     def ensure_hmpd(self) -> str:
-        try:
-            if self.hmpd_path and os.path.isfile(self.hmpd_path) and os.access(self.hmpd_path, os.X_OK):
-                return self.hmpd_path
-            return self.find_hmpd()
-        except FileNotFoundError as exc:
-            log.error(str(exc))
-            raise
+        if self.hmpd_path and os.path.isfile(self.hmpd_path) and os.access(self.hmpd_path, os.X_OK):
+            return self.hmpd_path
+        return self.find_hmpd()
 
     def mqtt_connect_loop(self) -> None:
         while True:
@@ -263,29 +282,24 @@ class HMPDBridge:
 
     def run_hmpd(self, controller: Controller, action_args: List[str]) -> List[str]:
         cmd = self.build_hmpd_cmd(controller, action_args)
-        if DEBUG_RAW:
+        if DEBUG:
             log.debug("Running: %s", shlex.join(cmd))
 
-        try:
-            with self.command_lock:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.command_timeout,
-                    check=False,
-                )
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"Could not execute hmpd command: {exc}") from exc
-        except OSError as exc:
-            raise RuntimeError(f"Could not execute hmpd command: {exc}") from exc
+        with self.command_lock:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.command_timeout,
+                check=False,
+            )
 
         stdout = (proc.stdout or "").replace("\r", "")
         stderr = (proc.stderr or "").replace("\r", "")
 
-        if DEBUG_RAW and stdout.strip():
+        if DEBUG and stdout.strip():
             log.debug("hmpd stdout:\n%s", stdout.strip())
-        if DEBUG_RAW and stderr.strip():
+        if DEBUG and stderr.strip():
             log.debug("hmpd stderr:\n%s", stderr.strip())
 
         if proc.returncode != 0:
@@ -294,7 +308,7 @@ class HMPDBridge:
         return [line.strip() for line in stdout.splitlines() if line.strip()]
 
     def valid_temp(self, value: float) -> bool:
-        return 5.0 < value < 50.0
+        return self.temp_min <= value <= self.temp_max
 
     def parse_regs(self, controller: Controller, lines: List[str]) -> List[Zone]:
         zones: List[Zone] = []
@@ -313,7 +327,9 @@ class HMPDBridge:
 
                 target = None
                 try:
-                    target = float(parts[3].split(":", 1)[1].strip())
+                    raw_target = float(parts[3].split(":", 1)[1].strip())
+                    if self.valid_temp(raw_target):
+                        target = raw_target
                 except Exception:
                     target = None
 
@@ -333,11 +349,11 @@ class HMPDBridge:
                 zone.zone_name = name
                 zone.enabled = enabled
                 if target is not None:
-                    zone.target_temp = target
+                    zone.target_temp = round(target, 1)
 
                 zones.append(zone)
 
-                if DEBUG_DUMP:
+                if DEBUG:
                     log.debug(
                         "REG parsed [%s] => idx=%s name=%s target=%s enabled=%s raw=%s",
                         controller.name, idx, name, target, enabled, original
@@ -362,7 +378,7 @@ class HMPDBridge:
 
                 parsed[idx] = round(val, 1)
 
-                if DEBUG_DUMP:
+                if DEBUG:
                     log.debug(
                         "TEMP parsed [%s] => idx=%s temp=%s raw=%s",
                         controller.name, idx, round(val, 1), original
@@ -372,17 +388,26 @@ class HMPDBridge:
 
         return parsed
 
+    def remove_stale_zones_for_controller(self, controller: Controller, valid_ids: set[str]) -> None:
+        to_remove = [
+            unique_id
+            for unique_id, zone in self.zones.items()
+            if zone.controller_name == controller.name and unique_id not in valid_ids
+        ]
+
+        for unique_id in to_remove:
+            discovery_topic = f"{self.discovery_prefix}/climate/hmpd_{unique_id}/config"
+            self.mqtt.publish(discovery_topic, "", qos=1, retain=True)
+            del self.zones[unique_id]
+            log.info("Removed stale discovery for %s", unique_id)
+
     def discovery_payload(self, zone: Zone) -> dict:
         state_topic = f"{self.base_topic}/{zone.unique_id}/state"
         command_topic = f"{self.base_topic}/{zone.unique_id}/set_target"
-        availability_topic = f"{self.base_topic}/bridge/status"
 
         return {
             "name": zone.zone_name,
             "unique_id": f"hmpd_{zone.unique_id}",
-            "availability_topic": availability_topic,
-            "payload_available": "online",
-            "payload_not_available": "offline",
             "current_temperature_topic": state_topic,
             "current_temperature_template": "{{ value_json.current_temp }}",
             "temperature_state_topic": state_topic,
@@ -411,12 +436,11 @@ class HMPDBridge:
         log.info("Published discovery for %s", zone.zone_name)
 
     def publish_state(self, zone: Zone) -> None:
-        mode = "heat" if zone.enabled is not False else "off"
         topic = f"{self.base_topic}/{zone.unique_id}/state"
         payload = {
             "current_temp": zone.current_temp,
-            "target_temp": zone.target_temp,
-            "mode": mode,
+            "target_temp": zone.target_temp if zone.target_temp is not None else self.temp_min,
+            "mode": "heat",
         }
         self.mqtt.publish(topic, json.dumps(payload), qos=1, retain=self.retain_state)
 
@@ -424,12 +448,14 @@ class HMPDBridge:
         lines = self.run_hmpd(controller, ["regs"])
         zones = self.parse_regs(controller, lines)
 
+        valid_ids: set[str] = set()
         for zone in zones:
+            valid_ids.add(zone.unique_id)
             self.zones[zone.unique_id] = zone
-            if not zone.discovered:
-                self.publish_discovery(zone)
+            self.publish_discovery(zone)
             self.publish_state(zone)
 
+        self.remove_stale_zones_for_controller(controller, valid_ids)
         log.info("Synced %s named zones from regs for controller %s", len(zones), controller.name)
 
     def sync_temps(self, controller: Controller) -> None:
@@ -490,4 +516,4 @@ class HMPDBridge:
 
 
 if __name__ == "__main__":
-    HMPDBridge(OPTIONS).start()
+    HMPDBridge().start()
