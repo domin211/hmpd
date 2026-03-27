@@ -15,7 +15,6 @@ import paho.mqtt.client as mqtt
 
 OPTIONS_PATH = "/data/options.json"
 
-# Hardcoded config
 MQTT_HOST = "core-mosquitto"
 MQTT_PORT = 1883
 MQTT_USERNAME = "ufandy"
@@ -26,7 +25,6 @@ MQTT_CLIENT_ID = "hmpd_bridge"
 MQTT_KEEPALIVE = 60
 MQTT_RETRY_SECONDS = 10
 
-# Your original script used both usb0 and usb1, stdbuf -oL, and a 5..50 temp sanity check. :contentReference[oaicite:0]{index=0}
 CONTROLLERS = [
     {"name": "usb0", "dev": "/dev/ttyUSB0", "baud": 4800},
     {"name": "usb1", "dev": "/dev/ttyUSB1", "baud": 4800},
@@ -41,7 +39,6 @@ TEMP_MIN = 16.0
 TEMP_MAX = 32.0
 TEMP_STEP = 0.1
 
-# Use the same sanity window style as your original script for "real" measured temps. :contentReference[oaicite:1]{index=1}
 CURRENT_TEMP_MIN = 5.0
 CURRENT_TEMP_MAX = 50.0
 
@@ -113,6 +110,7 @@ class Zone:
     target_temp: Optional[float] = None
     enabled: Optional[bool] = None
     discovered: bool = False
+    from_regs: bool = False
 
 
 class HMPDBridge:
@@ -142,6 +140,9 @@ class HMPDBridge:
             Controller(name=item["name"], dev=item["dev"], baud=int(item["baud"]))
             for item in CONTROLLERS
         ]
+        self.controllers_by_name: Dict[str, Controller] = {
+            controller.name: controller for controller in self.controllers
+        }
 
         self.zones: Dict[str, Zone] = {}
         self.command_lock = threading.Lock()
@@ -165,6 +166,46 @@ class HMPDBridge:
         value = re.sub(r"[^a-z0-9]+", "_", value)
         value = re.sub(r"_+", "_", value).strip("_")
         return value or "zone"
+
+    def zone_unique_id(self, controller_name: str, zone_index: int) -> str:
+        return f"{self.slugify(controller_name)}_{int(zone_index)}"
+
+    def default_zone_name(self, controller_name: str, zone_index: int) -> str:
+        return f"{controller_name.upper()} Zone {int(zone_index)}"
+
+    def get_or_create_zone(
+        self,
+        controller: Controller,
+        zone_index: int,
+        zone_name: Optional[str] = None,
+    ) -> Zone:
+        unique_id = self.zone_unique_id(controller.name, zone_index)
+        zone = self.zones.get(unique_id)
+        if zone is None:
+            zone = Zone(
+                controller_name=controller.name,
+                controller_dev=controller.dev,
+                zone_index=int(zone_index),
+                zone_name=zone_name or self.default_zone_name(controller.name, zone_index),
+                unique_id=unique_id,
+            )
+            self.zones[unique_id] = zone
+            if DEBUG:
+                log.debug(
+                    "Created placeholder zone [%s] idx=%s unique_id=%s name=%s",
+                    controller.name,
+                    zone_index,
+                    unique_id,
+                    zone.zone_name,
+                )
+        else:
+            zone.controller_name = controller.name
+            zone.controller_dev = controller.dev
+            zone.zone_index = int(zone_index)
+            if zone_name:
+                zone.zone_name = zone_name
+
+        return zone
 
     def hmpd_candidates(self) -> List[str]:
         candidates = [
@@ -274,7 +315,7 @@ class HMPDBridge:
             log.warning("Invalid target payload for %s: %s", zone_key, payload)
             return
 
-        value = max(self.temp_min, min(self.temp_max, value))
+        value = round(max(self.temp_min, min(self.temp_max, value)), 1)
         self.set_zone_target(zone, value)
 
     def build_hmpd_cmd(self, controller: Controller, action_args: List[str]) -> List[str]:
@@ -310,7 +351,6 @@ class HMPDBridge:
                 if DEBUG and stderr.strip():
                     log.debug("hmpd partial stderr after timeout:\n%s", stderr.strip())
 
-                # For regs, accept partial lines if the command printed useful data before hanging.
                 if action_args and action_args[0] == "regs" and stdout.strip():
                     log.warning(
                         "hmpd regs timed out for %s, using partial output (%s lines)",
@@ -350,21 +390,16 @@ class HMPDBridge:
                 idx = int(parts[0])
                 name = parts[1].strip()
                 if not name:
-                    continue
+                    name = self.default_zone_name(controller.name, idx)
 
                 m_cur = re.search(r"cur:\s*(-?\d+(?:\.\d+)?)", parts[2])
                 m_tgt = re.search(r"tgt:\s*(-?\d+(?:\.\d+)?)", parts[3])
-                if not m_cur:
-                    continue
 
-                current_temp = float(m_cur.group(1))
-                if not self.valid_current_temp(current_temp):
-                    if DEBUG:
-                        log.debug(
-                            "Skipping invalid zone [%s] idx=%s name=%s cur=%s raw=%s",
-                            controller.name, idx, name, current_temp, original
-                        )
-                    continue
+                current_temp = None
+                if m_cur:
+                    parsed_current = float(m_cur.group(1))
+                    if self.valid_current_temp(parsed_current):
+                        current_temp = round(parsed_current, 1)
 
                 target_temp = None
                 if m_tgt:
@@ -375,24 +410,33 @@ class HMPDBridge:
 
                 enabled = "EN" in parts[4]
 
-                unique = f"{self.slugify(controller.name)}_{idx}"
+                unique = self.zone_unique_id(controller.name, idx)
+                prev = self.zones.get(unique)
+
                 zone = Zone(
                     controller_name=controller.name,
                     controller_dev=controller.dev,
                     zone_index=idx,
                     zone_name=name,
                     unique_id=unique,
-                    current_temp=round(current_temp, 1),
-                    target_temp=target_temp,
+                    current_temp=current_temp if current_temp is not None else (prev.current_temp if prev else None),
+                    target_temp=target_temp if target_temp is not None else (prev.target_temp if prev else None),
                     enabled=enabled,
-                    discovered=self.zones.get(unique, Zone("", "", 0, "", unique)).discovered if unique in self.zones else False,
+                    discovered=prev.discovered if prev else False,
+                    from_regs=True,
                 )
                 zones.append(zone)
 
                 if DEBUG:
                     log.debug(
                         "REG parsed [%s] => idx=%s name=%s cur=%s tgt=%s enabled=%s raw=%s",
-                        controller.name, idx, name, zone.current_temp, zone.target_temp, enabled, original
+                        controller.name,
+                        idx,
+                        name,
+                        zone.current_temp,
+                        zone.target_temp,
+                        enabled,
+                        original,
                     )
             except Exception as exc:
                 log.error("REG parse error [%s]: %s | raw=%s", controller.name, exc, original)
@@ -417,7 +461,10 @@ class HMPDBridge:
                 if DEBUG:
                     log.debug(
                         "TEMP parsed [%s] => idx=%s temp=%s raw=%s",
-                        controller.name, idx, parsed[idx], original
+                        controller.name,
+                        idx,
+                        parsed[idx],
+                        original,
                     )
             except Exception as exc:
                 log.error("TEMP parse error [%s]: %s | raw=%s", controller.name, exc, original)
@@ -437,7 +484,7 @@ class HMPDBridge:
         to_remove = [
             unique_id
             for unique_id, zone in self.zones.items()
-            if zone.controller_name == controller.name and unique_id not in valid_ids
+            if zone.controller_name == controller.name and zone.from_regs and unique_id not in valid_ids
         ]
         for unique_id in to_remove:
             self.remove_zone(unique_id)
@@ -478,7 +525,6 @@ class HMPDBridge:
 
     def publish_state(self, zone: Zone) -> None:
         if zone.current_temp is None or not self.valid_current_temp(zone.current_temp):
-            self.remove_zone(zone.unique_id)
             return
 
         topic = f"{self.base_topic}/{zone.unique_id}/state"
@@ -499,46 +545,46 @@ class HMPDBridge:
             prev = self.zones.get(zone.unique_id)
             if prev is not None:
                 zone.discovered = prev.discovered
+                if zone.current_temp is None:
+                    zone.current_temp = prev.current_temp
+                if zone.target_temp is None:
+                    zone.target_temp = prev.target_temp
             self.zones[zone.unique_id] = zone
             self.publish_discovery(zone)
             self.publish_state(zone)
 
         self.remove_stale_zones_for_controller(controller, valid_ids)
-        log.info("Synced %s valid named zones from regs for controller %s", len(zones), controller.name)
+        log.info("Synced %s zones from regs for controller %s", len(zones), controller.name)
 
     def sync_temps(self, controller: Controller) -> None:
         lines = self.run_hmpd(controller, ["temps"], timeout=self.temps_timeout)
         temps = self.parse_temps(controller, lines)
 
-        # Only remove zones for this controller if we already know named zones from regs.
-        known_ids = [
-            unique_id
-            for unique_id, zone in self.zones.items()
-            if zone.controller_name == controller.name
-        ]
-        if known_ids:
-            valid_temp_ids = {
-                f"{self.slugify(controller.name)}_{idx}"
-                for idx in temps.keys()
-            }
-            to_remove = [
-                unique_id
-                for unique_id in known_ids
-                if unique_id not in valid_temp_ids
-            ]
-            for unique_id in to_remove:
-                self.remove_zone(unique_id)
-
         updated = 0
-        for zone in list(self.zones.values()):
-            if zone.controller_name != controller.name:
-                continue
-            if zone.zone_index in temps:
-                zone.current_temp = temps[zone.zone_index]
-                self.publish_state(zone)
-                updated += 1
+        created = 0
 
-        log.info("Synced %s temperatures for controller %s", updated, controller.name)
+        for idx, current_temp in temps.items():
+            unique_id = self.zone_unique_id(controller.name, idx)
+            zone = self.zones.get(unique_id)
+
+            if zone is None:
+                zone = self.get_or_create_zone(controller, idx)
+                created += 1
+
+            zone.current_temp = current_temp
+
+            if not zone.discovered:
+                self.publish_discovery(zone)
+
+            self.publish_state(zone)
+            updated += 1
+
+        log.info(
+            "Synced %s temperatures for controller %s (%s created)",
+            updated,
+            controller.name,
+            created,
+        )
 
     def sync_all_regs(self) -> None:
         for controller in self.controllers:
@@ -555,11 +601,14 @@ class HMPDBridge:
                 log.error("sync_temps failed for %s: %s", controller.name, exc)
 
     def set_zone_target(self, zone: Zone, target: float) -> None:
-        controller = next(c for c in self.controllers if c.name == zone.controller_name)
+        controller = self.controllers_by_name.get(zone.controller_name)
+        if controller is None:
+            raise RuntimeError(f"Unknown controller for zone {zone.unique_id}: {zone.controller_name}")
+
         self.run_hmpd(controller, ["set", str(zone.zone_index), f"{target:.1f}"], timeout=self.temps_timeout)
         zone.target_temp = target
         self.publish_state(zone)
-        log.info("Set %s to %.1f", zone.zone_name, target)
+        log.info("Set %s (%s) to %.1f", zone.zone_name, zone.unique_id, target)
 
     def start(self):
         self.find_hmpd()
