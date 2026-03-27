@@ -126,7 +126,7 @@ class HMPDBridge:
         self.mqtt.on_message = self.on_message
         self.mqtt.will_set(f"{self.base_topic}/bridge/status", payload="offline", qos=1, retain=True)
 
-        self.hmpd_path = self.find_hmpd()
+        self.hmpd_path = ""
 
     def slugify(self, value: str) -> str:
         value = value.strip().lower()
@@ -134,20 +134,28 @@ class HMPDBridge:
         value = re.sub(r"_+", "_", value).strip("_")
         return value or "zone"
 
-    def find_hmpd(self) -> str:
-        candidates = []
+    def hmpd_candidates(self) -> List[str]:
+        candidates: List[str] = []
         if self.configured_hmpd_path:
             candidates.append(self.configured_hmpd_path)
         candidates.extend([
-            "/ha_config/hmpd",
-            "/config/hmpd",
             "/homeassistant/hmpd",
+            "/config/hmpd",
+            "/ha_config/hmpd",
             "/app/hmpd",
             "./hmpd",
         ])
-
-        checked = []
+        seen = set()
+        ordered: List[str] = []
         for path in candidates:
+            if path not in seen:
+                ordered.append(path)
+                seen.add(path)
+        return ordered
+
+    def find_hmpd(self) -> str:
+        checked = []
+        for path in self.hmpd_candidates():
             checked.append(path)
             if os.path.isfile(path):
                 if not os.access(path, os.X_OK):
@@ -156,12 +164,22 @@ class HMPDBridge:
                     except Exception:
                         pass
                 if os.access(path, os.X_OK):
-                    log.info("Using hmpd binary: %s", path)
+                    if self.hmpd_path != path:
+                        log.info("Using hmpd binary: %s", path)
+                    self.hmpd_path = path
                     return path
 
         msg = "Could not find executable hmpd. Checked: " + ", ".join(checked)
-        log.error(msg)
         raise FileNotFoundError(msg)
+
+    def ensure_hmpd(self) -> str:
+        try:
+            if self.hmpd_path and os.path.isfile(self.hmpd_path) and os.access(self.hmpd_path, os.X_OK):
+                return self.hmpd_path
+            return self.find_hmpd()
+        except FileNotFoundError as exc:
+            log.error(str(exc))
+            raise
 
     def mqtt_connect_loop(self) -> None:
         while True:
@@ -235,8 +253,9 @@ class HMPDBridge:
         self.set_zone_target(zone, value)
 
     def run_hmpd(self, controller: Controller, action_args: List[str]) -> List[str]:
+        hmpd = self.ensure_hmpd()
         cmd = [
-            self.hmpd_path,
+            hmpd,
             "--dev", controller.dev,
             "--baud", str(controller.baud),
             *action_args,
@@ -244,14 +263,30 @@ class HMPDBridge:
         if DEBUG_RAW:
             log.debug("Running: %s", shlex.join(cmd))
 
-        with self.command_lock:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self.command_timeout,
-                check=False,
-            )
+        try:
+            with self.command_lock:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.command_timeout,
+                    check=False,
+                )
+        except FileNotFoundError as exc:
+            candidates = ", ".join(self.hmpd_candidates())
+            raise RuntimeError(
+                f"Could not execute hmpd at {hmpd}. "
+                f"The file may exist but still fail with ENOENT if it is built for the wrong CPU "
+                f"architecture or needs a missing dynamic loader/library inside the add-on container. "
+                f"Checked candidates: {candidates}. Original error: {exc}"
+            ) from exc
+        except OSError as exc:
+            candidates = ", ".join(self.hmpd_candidates())
+            raise RuntimeError(
+                f"Could not execute hmpd at {hmpd}. "
+                f"This usually means wrong CPU architecture, missing shared libraries, or invalid executable format. "
+                f"Checked candidates: {candidates}. Original error: {exc}"
+            ) from exc
 
         stdout = (proc.stdout or "").replace("\r", "")
         stderr = (proc.stderr or "").replace("\r", "")
@@ -287,7 +322,7 @@ class HMPDBridge:
             if not name:
                 name = f"Zone {idx + 1}"
 
-            unique = f"{self.slugify(controller.name)}_{idx+1}"
+            unique = f"{self.slugify(controller.name)}_{idx + 1}"
             zone = self.zones.get(unique)
             if zone is None:
                 zone = Zone(
@@ -441,6 +476,7 @@ class HMPDBridge:
         log.info("Set %s to %.1f", zone.zone_name, target)
 
     def start(self):
+        self.find_hmpd()
         log.info("=== HMPD Thermostat Bridge starting ===")
         for controller in self.controllers:
             log.info("Configured controller %s -> %s @ %s", controller.name, controller.dev, controller.baud)
