@@ -131,11 +131,7 @@ class HMPDBridge:
         self.configured_hmpd_path = HMPD_PATH
 
         self.controllers: List[Controller] = [
-            Controller(
-                name=item["name"],
-                dev=item["dev"],
-                baud=int(item["baud"]),
-            )
+            Controller(name=item["name"], dev=item["dev"], baud=int(item["baud"]))
             for item in CONTROLLERS
         ]
 
@@ -233,7 +229,6 @@ class HMPDBridge:
         if reason_text == "Success":
             self.mqtt_connected = True
             log.info("Connected to MQTT broker %s:%s", self.mqtt_host, self.mqtt_port)
-            client.publish(f"{self.base_topic}/bridge/status", "online", qos=1, retain=True)
             client.subscribe(f"{self.base_topic}/+/set_target")
             client.subscribe(f"{self.base_topic}/bridge/resync")
         else:
@@ -247,7 +242,8 @@ class HMPDBridge:
     def on_message(self, client, userdata, msg):
         topic = msg.topic
         payload = msg.payload.decode("utf-8", errors="ignore").strip()
-        log.debug("MQTT message: %s => %s", topic, payload)
+        if DEBUG:
+            log.debug("MQTT message: %s => %s", topic, payload)
 
         if topic == f"{self.base_topic}/bridge/resync":
             self.sync_all_regs()
@@ -307,8 +303,8 @@ class HMPDBridge:
 
         return [line.strip() for line in stdout.splitlines() if line.strip()]
 
-    def valid_temp(self, value: float) -> bool:
-        return self.temp_min <= value <= self.temp_max
+    def valid_current_temp(self, value: float) -> bool:
+        return 0.0 <= value <= 100.0
 
     def parse_regs(self, controller: Controller, lines: List[str]) -> List[Zone]:
         zones: List[Zone] = []
@@ -325,15 +321,27 @@ class HMPDBridge:
                 if not name:
                     continue
 
-                target = None
-                try:
-                    raw_target = float(parts[3].split(":", 1)[1].strip())
-                    if self.valid_temp(raw_target):
-                        target = raw_target
-                except Exception:
-                    target = None
+                current_temp = None
+                target_temp = None
+
+                m_cur = re.search(r"cur:\s*(-?\d+(?:\.\d+)?)", parts[2])
+                if m_cur:
+                    current_temp = float(m_cur.group(1))
+
+                m_tgt = re.search(r"tgt:\s*(-?\d+(?:\.\d+)?)", parts[3])
+                if m_tgt:
+                    target_temp = float(m_tgt.group(1))
 
                 enabled = "EN" in parts[4]
+
+                # Keep only sane zones with a real current temperature.
+                if current_temp is None or not self.valid_current_temp(current_temp):
+                    if DEBUG:
+                        log.debug(
+                            "Skipping nonsensical zone [%s] idx=%s name=%s cur=%s raw=%s",
+                            controller.name, idx, name, current_temp, original
+                        )
+                    continue
 
                 unique = f"{self.slugify(controller.name)}_{idx}"
                 zone = self.zones.get(unique)
@@ -347,16 +355,27 @@ class HMPDBridge:
                     )
 
                 zone.zone_name = name
+                zone.current_temp = round(current_temp, 1)
                 zone.enabled = enabled
-                if target is not None:
-                    zone.target_temp = round(target, 1)
+
+                if target_temp is not None:
+                    zone.target_temp = round(
+                        max(self.temp_min, min(self.temp_max, target_temp)),
+                        1,
+                    )
 
                 zones.append(zone)
 
                 if DEBUG:
                     log.debug(
-                        "REG parsed [%s] => idx=%s name=%s target=%s enabled=%s raw=%s",
-                        controller.name, idx, name, target, enabled, original
+                        "REG parsed [%s] => idx=%s name=%s cur=%s tgt=%s enabled=%s raw=%s",
+                        controller.name,
+                        idx,
+                        name,
+                        zone.current_temp,
+                        zone.target_temp,
+                        enabled,
+                        original,
                     )
             except Exception as exc:
                 log.error("REG parse error [%s]: %s | raw=%s", controller.name, exc, original)
@@ -373,7 +392,7 @@ class HMPDBridge:
                 idx = int(idx_str.strip())
                 val = float(val_str.strip())
 
-                if not self.valid_temp(val):
+                if not self.valid_current_temp(val):
                     continue
 
                 parsed[idx] = round(val, 1)
@@ -381,7 +400,7 @@ class HMPDBridge:
                 if DEBUG:
                     log.debug(
                         "TEMP parsed [%s] => idx=%s temp=%s raw=%s",
-                        controller.name, idx, round(val, 1), original
+                        controller.name, idx, parsed[idx], original
                     )
             except Exception as exc:
                 log.error("TEMP parse error [%s]: %s | raw=%s", controller.name, exc, original)
@@ -456,7 +475,7 @@ class HMPDBridge:
             self.publish_state(zone)
 
         self.remove_stale_zones_for_controller(controller, valid_ids)
-        log.info("Synced %s named zones from regs for controller %s", len(zones), controller.name)
+        log.info("Synced %s valid named zones from regs for controller %s", len(zones), controller.name)
 
     def sync_temps(self, controller: Controller) -> None:
         lines = self.run_hmpd(controller, ["temps"])
