@@ -40,7 +40,7 @@ options:
   temp_min: 10.0
   temp_max: 35.5
   temp_step: 0.1
-  hmpd_path: /homeassistant/hmpd
+  hmpd_path: /homeassistant/
   retain_discovery: true
   retain_state: true
   log_level: info
