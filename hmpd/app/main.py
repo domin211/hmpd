@@ -494,7 +494,6 @@ class HMPDBridge:
                 "name": zone.zone_name,
                 "manufacturer": "HMPD",
                 "model": "Thermostat Regulator",
-                "via_device": f"hmpd_bridge_{self.slugify(zone.controller_name)}",
             },
         }
 
@@ -667,7 +666,7 @@ class HMPDBridge:
                     continue
 
                 log.info("Applying queued set for %s (%s) -> %.1f", zone.zone_name, zone.unique_id, queued_target)
-                lines, timed_out = self.run_hmpd(
+                _, timed_out = self.run_hmpd(
                     controller,
                     ["set", str(zone.zone_index), f"{queued_target:.1f}"],
                     timeout=self.set_timeout,
