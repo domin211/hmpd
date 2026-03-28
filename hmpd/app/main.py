@@ -279,6 +279,89 @@ class HMPDBridge:
 
         log.info("Published retained cleanup for %s legacy alias topic candidates", len(candidates))
 
+
+    def scan_and_cleanup_discovery_topics(self, wait_seconds: float = 3.0) -> None:
+        """
+        Subscribe to Home Assistant MQTT discovery and actively remove any retained
+        HMPD thermostat config topics from older buggy versions, regardless of the
+        old unique_id/topic naming scheme.
+        """
+        found_topics: Set[str] = set()
+        found_state_topics: Set[str] = set()
+        found_command_topics: Set[str] = set()
+        prefix = f"{self.discovery_prefix}/climate/"
+
+        def looks_like_hmpd_config(topic: str, payload_text: str) -> bool:
+            if not topic.startswith(prefix):
+                return False
+
+            low_topic = topic.lower()
+            low_payload = payload_text.lower()
+
+            if "/climate/hmpd" in low_topic:
+                return True
+            if '"manufacturer": "hmpd"' in low_payload or '"manufacturer":"hmpd"' in low_payload:
+                return True
+            if '"model": "thermostat regulator"' in low_payload or '"model":"thermostat regulator"' in low_payload:
+                return True
+            if '"via_device": "hmpd_bridge_' in low_payload or '"via_device":"hmpd_bridge_' in low_payload:
+                return True
+            if '"identifiers": ["hmpd_' in low_payload or '"identifiers":["hmpd_' in low_payload:
+                return True
+            if '"unique_id": "hmpd_' in low_payload or '"unique_id":"hmpd_' in low_payload:
+                return True
+            if '"object_id": "hmpd_' in low_payload or '"object_id":"hmpd_' in low_payload:
+                return True
+            return False
+
+        original_on_message = self.mqtt.on_message
+
+        def scan_on_message(client, userdata, msg):
+            payload_text = msg.payload.decode("utf-8", errors="ignore")
+            try:
+                if looks_like_hmpd_config(msg.topic, payload_text):
+                    found_topics.add(msg.topic)
+                    try:
+                        data = json.loads(payload_text) if payload_text.strip() else {}
+                    except Exception:
+                        data = {}
+                    state_topic = data.get("current_temperature_topic") or data.get("temperature_state_topic") or data.get("state_topic")
+                    command_topic = data.get("temperature_command_topic") or data.get("command_topic")
+                    if isinstance(state_topic, str) and state_topic:
+                        found_state_topics.add(state_topic)
+                    if isinstance(command_topic, str) and command_topic:
+                        found_command_topics.add(command_topic)
+            finally:
+                if original_on_message is not None:
+                    original_on_message(client, userdata, msg)
+
+        self.mqtt.on_message = scan_on_message
+        try:
+            self.mqtt.subscribe(f"{self.discovery_prefix}/climate/#", qos=1)
+            end = time.time() + wait_seconds
+            while time.time() < end:
+                time.sleep(0.1)
+        finally:
+            try:
+                self.mqtt.unsubscribe(f"{self.discovery_prefix}/climate/#")
+            except Exception:
+                pass
+            self.mqtt.on_message = original_on_message
+
+        for topic in sorted(found_topics):
+            self.mqtt.publish(topic, "", qos=1, retain=True)
+        for topic in sorted(found_state_topics):
+            self.mqtt.publish(topic, "", qos=1, retain=True)
+        for topic in sorted(found_command_topics):
+            self.mqtt.publish(topic, "", qos=1, retain=True)
+
+        log.info(
+            "Scanned discovery and removed %s retained HMPD config topics (%s state, %s command)",
+            len(found_topics),
+            len(found_state_topics),
+            len(found_command_topics),
+        )
+
     def hmpd_candidates(self) -> List[str]:
         candidates = [
             self.configured_hmpd_path,
@@ -719,6 +802,7 @@ class HMPDBridge:
                 log.error("sync_temps failed for %s: %s", controller.name, exc)
 
     def force_full_republish(self) -> None:
+        self.scan_and_cleanup_discovery_topics()
         self.cleanup_all_retained_topics()
         self.cleanup_legacy_alias_topics()
         self.zones = {}
