@@ -318,22 +318,25 @@ class HMPDBridge:
 
         def scan_on_message(client, userdata, msg):
             payload_text = msg.payload.decode("utf-8", errors="ignore")
-            try:
-                if looks_like_hmpd_config(msg.topic, payload_text):
-                    found_topics.add(msg.topic)
-                    try:
-                        data = json.loads(payload_text) if payload_text.strip() else {}
-                    except Exception:
-                        data = {}
-                    state_topic = data.get("current_temperature_topic") or data.get("temperature_state_topic") or data.get("state_topic")
-                    command_topic = data.get("temperature_command_topic") or data.get("command_topic")
-                    if isinstance(state_topic, str) and state_topic:
-                        found_state_topics.add(state_topic)
-                    if isinstance(command_topic, str) and command_topic:
-                        found_command_topics.add(command_topic)
-            finally:
-                if original_on_message is not None:
-                    original_on_message(client, userdata, msg)
+            matched = False
+            if looks_like_hmpd_config(msg.topic, payload_text):
+                matched = True
+                found_topics.add(msg.topic)
+                try:
+                    data = json.loads(payload_text) if payload_text.strip() else {}
+                except Exception:
+                    data = {}
+                state_topic = data.get("current_temperature_topic") or data.get("temperature_state_topic") or data.get("state_topic")
+                command_topic = data.get("temperature_command_topic") or data.get("command_topic")
+                if isinstance(state_topic, str) and state_topic:
+                    found_state_topics.add(state_topic)
+                if isinstance(command_topic, str) and command_topic:
+                    found_command_topics.add(command_topic)
+
+            # During the cleanup scan, do not feed retained Home Assistant discovery
+            # messages back into the normal handler. That only creates noisy debug output.
+            if not matched and original_on_message is not None:
+                original_on_message(client, userdata, msg)
 
         self.mqtt.on_message = scan_on_message
         try:
@@ -459,9 +462,18 @@ class HMPDBridge:
                 return
 
             zone_key = m.group(1)
+
+            # Empty retained payloads are used intentionally during cleanup to clear any
+            # stale command topics left by older buggy versions. Ignore them silently.
+            if not payload:
+                if DEBUG:
+                    log.debug("Ignoring empty target payload for %s", zone_key)
+                return
+
             zone = self.zones.get(zone_key)
             if not zone:
-                log.warning("Unknown zone key from MQTT: %s", zone_key)
+                if DEBUG:
+                    log.debug("Ignoring target payload for unknown zone key: %s", zone_key)
                 return
 
             try:
