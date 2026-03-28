@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 import paho.mqtt.client as mqtt
@@ -16,13 +16,13 @@ import paho.mqtt.client as mqtt
 
 OPTIONS_PATH = "/data/options.json"
 
-MQTT_HOST = "core-mosquitto"
-MQTT_PORT = 1883
-MQTT_USERNAME = "ufandy"
-MQTT_PASSWORD = "Fanda18067"
-MQTT_DISCOVERY_PREFIX = "homeassistant"
-MQTT_BASE_TOPIC = "hmpd"
-MQTT_CLIENT_ID = "hmpd_bridge"
+MQTT_HOST = os.getenv("MQTT_HOST", "core-mosquitto")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "ufandy")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "Fanda18067")
+MQTT_DISCOVERY_PREFIX = os.getenv("MQTT_DISCOVERY_PREFIX", "homeassistant")
+MQTT_BASE_TOPIC = os.getenv("MQTT_BASE_TOPIC", "hmpd")
+MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "hmpd_bridge")
 MQTT_KEEPALIVE = 60
 MQTT_RETRY_SECONDS = 10
 
@@ -99,16 +99,25 @@ if DEBUG:
     logging.getLogger().addHandler(fh)
 
 
-@dataclass
+@dataclass(frozen=True)
 class Controller:
     name: str
     dev: str
     baud: int
 
+    @property
+    def key(self) -> str:
+        base = os.path.basename(self.dev) or self.name
+        value = f"{self.name}_{base}"
+        value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+        value = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").lower()
+        return value or self.name.lower()
+
 
 @dataclass
 class Zone:
     controller_name: str
+    controller_key: str
     controller_dev: str
     zone_index: int
     zone_name: str
@@ -117,6 +126,8 @@ class Zone:
     target_temp: Optional[float] = None
     enabled: Optional[bool] = None
     discovered: bool = False
+    last_discovery_payload: Optional[str] = None
+    last_state_payload: Optional[str] = None
 
 
 class HMPDBridge:
@@ -150,9 +161,13 @@ class HMPDBridge:
         self.controllers_by_name: Dict[str, Controller] = {
             controller.name: controller for controller in self.controllers
         }
+        self.controllers_by_key: Dict[str, Controller] = {
+            controller.key: controller for controller in self.controllers
+        }
 
         self.zones: Dict[str, Zone] = {}
         self.latest_temps: Dict[str, Dict[int, float]] = {}
+        self.latest_regs: Dict[str, Dict[int, dict]] = {}
         self.command_lock = threading.Lock()
         self.last_regs_refresh = 0.0
         self.mqtt_connected = False
@@ -165,6 +180,7 @@ class HMPDBridge:
         self.mqtt.on_connect = self.on_connect
         self.mqtt.on_disconnect = self.on_disconnect
         self.mqtt.on_message = self.on_message
+        self.mqtt.reconnect_delay_set(min_delay=1, max_delay=30)
 
         self.hmpd_path = ""
         self.stdbuf_path = shutil.which("stdbuf")
@@ -178,8 +194,8 @@ class HMPDBridge:
         value = re.sub(r"_+", "_", value).strip("_")
         return value or "zone"
 
-    def zone_unique_id(self, controller_name: str, zone_index: int) -> str:
-        return f"{self.slugify(controller_name)}_{int(zone_index)}"
+    def zone_unique_id(self, controller: Controller, zone_index: int) -> str:
+        return f"{controller.key}_{int(zone_index)}"
 
     def state_topic(self, unique_id: str) -> str:
         return f"{self.base_topic}/{unique_id}/state"
@@ -193,6 +209,7 @@ class HMPDBridge:
     def cleanup_unique_id(self, unique_id: str) -> None:
         self.mqtt.publish(self.discovery_topic(unique_id), "", qos=1, retain=True)
         self.mqtt.publish(self.state_topic(unique_id), "", qos=1, retain=True)
+        self.mqtt.publish(self.command_topic(unique_id), "", qos=1, retain=True)
 
     def zone_alias_candidates(self, controller: Controller, idx: int, name: str) -> Set[str]:
         """Best-effort cleanup of old retained discovery topics from previous buggy versions."""
@@ -201,6 +218,7 @@ class HMPDBridge:
         name_slug = self.slugify(base_name)
         ascii_slug = self.slugify(ascii_name)
         ctrl_slug = self.slugify(controller.name)
+        ctrl_key_slug = self.slugify(controller.key)
 
         raw_variants = {
             base_name,
@@ -212,13 +230,15 @@ class HMPDBridge:
         }
 
         candidates: Set[str] = {
-            self.zone_unique_id(controller.name, idx),
+            self.zone_unique_id(controller, idx),
+            f"{ctrl_slug}_{idx}",
+            f"{ctrl_key_slug}_{idx}",
             f"{ctrl_slug}_{idx}_{name_slug}",
             f"{ctrl_slug}_{idx}_{ascii_slug}",
+            f"{ctrl_key_slug}_{idx}_{name_slug}",
+            f"{ctrl_key_slug}_{idx}_{ascii_slug}",
             f"{ctrl_slug}_{name_slug}",
             f"{ctrl_slug}_{ascii_slug}",
-            f"{ctrl_slug}_{name_slug}_{idx}",
-            f"{ctrl_slug}_{ascii_slug}_{idx}",
             f"{name_slug}",
             f"{ascii_slug}",
             f"zone_{idx}",
@@ -231,6 +251,9 @@ class HMPDBridge:
             candidates.add(f"{ctrl_slug}_{raw_slug}")
             candidates.add(f"{ctrl_slug}_{idx}_{raw_slug}")
             candidates.add(f"{ctrl_slug}_{raw_slug}_{idx}")
+            candidates.add(f"{ctrl_key_slug}_{raw_slug}")
+            candidates.add(f"{ctrl_key_slug}_{idx}_{raw_slug}")
+            candidates.add(f"{ctrl_key_slug}_{raw_slug}_{idx}")
 
         return {c for c in candidates if c}
 
@@ -239,7 +262,8 @@ class HMPDBridge:
 
         for controller in self.controllers:
             for idx in range(MAX_ZONE_INDEX):
-                candidates.add(self.zone_unique_id(controller.name, idx))
+                candidates.add(self.zone_unique_id(controller, idx))
+                candidates.add(f"{self.slugify(controller.name)}_{idx}")
 
         for unique_id in list(self.zones.keys()):
             candidates.add(unique_id)
@@ -264,13 +288,14 @@ class HMPDBridge:
             except Exception as exc:
                 log.warning("Legacy alias cleanup scan failed for %s: %s", controller.name, exc)
 
-        # A few extra generic leftovers from older broken versions.
         generic = {
             "unnamed_device",
             "thermostat_regulator",
             "hmpd",
             "usb0",
             "usb1",
+            "ttyusb0",
+            "ttyusb1",
         }
         candidates.update(generic)
 
@@ -278,7 +303,6 @@ class HMPDBridge:
             self.cleanup_unique_id(unique_id)
 
         log.info("Published retained cleanup for %s legacy alias topic candidates", len(candidates))
-
 
     def scan_and_cleanup_discovery_topics(self, wait_seconds: float = 3.0) -> None:
         """
@@ -326,15 +350,17 @@ class HMPDBridge:
                     data = json.loads(payload_text) if payload_text.strip() else {}
                 except Exception:
                     data = {}
-                state_topic = data.get("current_temperature_topic") or data.get("temperature_state_topic") or data.get("state_topic")
+                state_topic = (
+                    data.get("current_temperature_topic")
+                    or data.get("temperature_state_topic")
+                    or data.get("state_topic")
+                )
                 command_topic = data.get("temperature_command_topic") or data.get("command_topic")
                 if isinstance(state_topic, str) and state_topic:
                     found_state_topics.add(state_topic)
                 if isinstance(command_topic, str) and command_topic:
                     found_command_topics.add(command_topic)
 
-            # During the cleanup scan, do not feed retained Home Assistant discovery
-            # messages back into the normal handler. That only creates noisy debug output.
             if not matched and original_on_message is not None:
                 original_on_message(client, userdata, msg)
 
@@ -431,6 +457,16 @@ class HMPDBridge:
 
             time.sleep(self.mqtt_retry_seconds)
 
+    def ensure_mqtt_connected(self) -> None:
+        if self.mqtt_connected:
+            return
+        try:
+            self.mqtt.loop_stop()
+        except Exception:
+            pass
+        self.mqtt_connect_loop()
+        self.publish_bridge_status(True)
+
     def on_connect(self, client, userdata, flags, reason_code, properties):
         if str(reason_code) == "Success":
             self.mqtt_connected = True
@@ -463,8 +499,6 @@ class HMPDBridge:
 
             zone_key = m.group(1)
 
-            # Empty retained payloads are used intentionally during cleanup to clear any
-            # stale command topics left by older buggy versions. Ignore them silently.
             if not payload:
                 if DEBUG:
                     log.debug("Ignoring empty target payload for %s", zone_key)
@@ -660,8 +694,9 @@ class HMPDBridge:
                 "name": zone.zone_name,
                 "manufacturer": "HMPD",
                 "model": "Thermostat Regulator",
-                "via_device": f"hmpd_bridge_{self.slugify(zone.controller_name)}",
+                "via_device": f"hmpd_bridge_{zone.controller_key}",
             },
+            "suggested_area": zone.controller_name,
         }
 
     def publish_bridge_status(self, online: bool) -> None:
@@ -675,18 +710,27 @@ class HMPDBridge:
 
     def publish_discovery(self, zone: Zone) -> None:
         topic = self.discovery_topic(zone.unique_id)
-        payload = self.discovery_payload(zone)
-        self.mqtt.publish(topic, json.dumps(payload), qos=1, retain=self.retain_discovery)
+        payload = json.dumps(self.discovery_payload(zone), ensure_ascii=False, sort_keys=True)
+        if zone.last_discovery_payload == payload and zone.discovered:
+            return
+        self.mqtt.publish(topic, payload, qos=1, retain=self.retain_discovery)
+        zone.last_discovery_payload = payload
         zone.discovered = True
 
     def publish_state(self, zone: Zone) -> None:
         topic = self.state_topic(zone.unique_id)
-        payload = {
-            "current_temp": zone.current_temp if zone.current_temp is not None else self.temp_min,
-            "target_temp": zone.target_temp if zone.target_temp is not None else self.temp_min,
-            "mode": "heat",
-        }
-        self.mqtt.publish(topic, json.dumps(payload), qos=1, retain=self.retain_state)
+        payload = json.dumps(
+            {
+                "current_temp": zone.current_temp if zone.current_temp is not None else self.temp_min,
+                "target_temp": zone.target_temp if zone.target_temp is not None else self.temp_min,
+                "mode": "heat",
+            },
+            sort_keys=True,
+        )
+        if zone.last_state_payload == payload:
+            return
+        self.mqtt.publish(topic, payload, qos=1, retain=self.retain_state)
+        zone.last_state_payload = payload
 
     def remove_zone(self, unique_id: str) -> None:
         self.cleanup_unique_id(unique_id)
@@ -697,33 +741,34 @@ class HMPDBridge:
     def sync_temps(self, controller: Controller) -> None:
         lines, _ = self.run_hmpd(controller, ["temps"], timeout=self.temps_timeout)
         temps = self.parse_temps(controller, lines)
-        self.latest_temps[controller.name] = temps
+        self.latest_temps[controller.key] = temps
 
-        current_valid_ids = {
-            self.zone_unique_id(controller.name, idx)
-            for idx in temps.keys()
-        }
+        regs = self.latest_regs.get(controller.key, {})
+        valid_indices = {idx for idx in temps.keys() if idx in regs and (regs[idx].get("name") or "").strip()}
+        if not valid_indices:
+            valid_indices = set(temps.keys())
+
+        current_valid_ids = {self.zone_unique_id(controller, idx) for idx in valid_indices}
 
         to_remove = [
             unique_id
             for unique_id, zone in self.zones.items()
-            if zone.controller_name == controller.name and unique_id not in current_valid_ids
+            if zone.controller_key == controller.key and unique_id not in current_valid_ids
         ]
         for unique_id in to_remove:
             self.remove_zone(unique_id)
 
         updated = 0
-        for idx, current_temp in temps.items():
-            unique_id = self.zone_unique_id(controller.name, idx)
+        for idx in valid_indices:
+            current_temp = temps[idx]
+            unique_id = self.zone_unique_id(controller, idx)
             zone = self.zones.get(unique_id)
             if zone:
                 zone.current_temp = current_temp
                 self.publish_state(zone)
                 updated += 1
 
-        total_active = len(
-            [zone for zone in self.zones.values() if zone.controller_name == controller.name]
-        )
+        total_active = len([zone for zone in self.zones.values() if zone.controller_key == controller.key])
 
         log.info(
             "Cached %s temperatures for controller %s (%s active zones updated, %s total active)",
@@ -736,12 +781,15 @@ class HMPDBridge:
     def sync_regs(self, controller: Controller) -> None:
         lines, is_partial = self.run_hmpd(controller, ["regs"], timeout=self.regs_timeout)
         parsed = self.parse_regs(controller, lines)
-        temps = self.latest_temps.get(controller.name, {})
+        self.latest_regs[controller.key] = parsed
+        temps = self.latest_temps.get(controller.key, {})
 
         created = 0
         updated = 0
         skipped_no_temp = 0
         valid_unique_ids: Set[str] = set()
+
+        seen_zone_names: Dict[str, int] = {}
 
         for idx, data in parsed.items():
             name = data["name"].strip() if data["name"] else ""
@@ -753,13 +801,15 @@ class HMPDBridge:
                 continue
 
             current_temp = temps[idx]
-            unique_id = self.zone_unique_id(controller.name, idx)
+            unique_id = self.zone_unique_id(controller, idx)
             valid_unique_ids.add(unique_id)
             zone = self.zones.get(unique_id)
+            seen_zone_names[name.casefold()] = seen_zone_names.get(name.casefold(), 0) + 1
 
             if zone is None:
                 zone = Zone(
                     controller_name=controller.name,
+                    controller_key=controller.key,
                     controller_dev=controller.dev,
                     zone_index=idx,
                     zone_name=name,
@@ -785,10 +835,18 @@ class HMPDBridge:
         stale_for_controller = [
             unique_id
             for unique_id, zone in self.zones.items()
-            if zone.controller_name == controller.name and unique_id not in valid_unique_ids
+            if zone.controller_key == controller.key and unique_id not in valid_unique_ids
         ]
         for unique_id in stale_for_controller:
             self.remove_zone(unique_id)
+
+        duplicate_names = sorted(name for name, count in seen_zone_names.items() if count > 1)
+        if duplicate_names:
+            log.warning(
+                "Controller %s returned duplicate zone names for multiple indices: %s",
+                controller.name,
+                ", ".join(duplicate_names),
+            )
 
         log.info(
             "Synced regs for %s (%s created, %s updated, %s skipped_no_temp)%s",
@@ -819,6 +877,7 @@ class HMPDBridge:
         self.cleanup_legacy_alias_topics()
         self.zones = {}
         self.latest_temps = {}
+        self.latest_regs = {}
         self.sync_all_temps()
         self.sync_all_regs()
 
@@ -850,7 +909,7 @@ class HMPDBridge:
         self.find_hmpd()
         log.info("=== HMPD Thermostat Bridge starting ===")
         for controller in self.controllers:
-            log.info("Configured controller %s -> %s @ %s", controller.name, controller.dev, controller.baud)
+            log.info("Configured controller %s -> %s @ %s (key=%s)", controller.name, controller.dev, controller.baud, controller.key)
 
         self.mqtt_connect_loop()
         self.publish_bridge_status(True)
@@ -858,6 +917,7 @@ class HMPDBridge:
         self.last_regs_refresh = time.monotonic()
 
         while True:
+            self.ensure_mqtt_connected()
             now = time.monotonic()
             if now - self.last_regs_refresh >= self.reg_refresh_interval:
                 self.sync_all_regs()
