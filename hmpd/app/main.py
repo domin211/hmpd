@@ -7,9 +7,10 @@ import shutil
 import subprocess
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import paho.mqtt.client as mqtt
 
@@ -18,7 +19,7 @@ OPTIONS_PATH = "/data/options.json"
 
 MQTT_HOST = "core-mosquitto"
 MQTT_PORT = 1883
-MQTT_USERNAME = "fanda"
+MQTT_USERNAME = "ufandy"
 MQTT_PASSWORD = "Fanda18067"
 MQTT_DISCOVERY_PREFIX = "homeassistant"
 MQTT_BASE_TOPIC = "hmpd"
@@ -161,6 +162,7 @@ class HMPDBridge:
         self.last_regs_refresh = 0.0
         self.mqtt_connected = False
         self.cleanup_done = False
+        self.legacy_cleanup_done = False
 
         self.mqtt = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -180,6 +182,11 @@ class HMPDBridge:
         value = re.sub(r"_+", "_", value).strip("_")
         return value or "zone"
 
+    def slugify_ascii(self, value: str) -> str:
+        value = unicodedata.normalize("NFKD", value)
+        value = value.encode("ascii", "ignore").decode("ascii")
+        return self.slugify(value)
+
     def zone_unique_id(self, controller_name: str, zone_index: int) -> str:
         return f"{self.slugify(controller_name)}_{int(zone_index)}"
 
@@ -188,7 +195,7 @@ class HMPDBridge:
 
     def clamp_target(self, value: float) -> float:
         value = max(self.temp_min, min(self.temp_max, float(value)))
-        return round((value * 2.0)) / 2.0
+        return round(value * 2.0) / 2.0
 
     def hmpd_candidates(self) -> List[str]:
         candidates = [
@@ -527,6 +534,10 @@ class HMPDBridge:
             del self.zones[unique_id]
         log.info("Removed thermostat %s", unique_id)
 
+    def _clear_discovery_topic(self, suffix: str) -> None:
+        topic = f"{self.discovery_prefix}/climate/{suffix}/config"
+        self.mqtt.publish(topic, "", qos=1, retain=True)
+
     def purge_index_topics(self) -> None:
         for controller in self.controllers:
             for idx in range(64):
@@ -536,13 +547,45 @@ class HMPDBridge:
                 self.mqtt.publish(discovery_topic, "", qos=1, retain=True)
                 self.mqtt.publish(state_topic, "", qos=1, retain=True)
 
-        # old unnamed-parent placeholders created by via_device references
         for controller in self.controllers:
             bridge_id = f"hmpd_bridge_{self.slugify(controller.name)}"
-            legacy_device_topic = f"{self.discovery_prefix}/device/{bridge_id}/config"
-            self.mqtt.publish(legacy_device_topic, "", qos=1, retain=True)
+            device_topic = f"{self.discovery_prefix}/device/{bridge_id}/config"
+            self.mqtt.publish(device_topic, "", qos=1, retain=True)
 
-        log.info("Published retained cleanup for all indexed discovery/state topics")
+        log.info("Published retained cleanup for all indexed topics")
+
+    def legacy_discovery_suffixes_for_zone(self, zone: Zone) -> Set[str]:
+        controller_slug = self.slugify(zone.controller_name)
+        name_raw = zone.zone_name.strip()
+        name_slug = self.slugify(name_raw)
+        name_ascii_slug = self.slugify_ascii(name_raw)
+        idx = str(zone.zone_index)
+
+        suffixes = {
+            f"hmpd_{zone.unique_id}",
+            zone.unique_id,
+            f"hmpd_{name_slug}",
+            name_slug,
+            f"hmpd_{name_ascii_slug}",
+            name_ascii_slug,
+            f"hmpd_{controller_slug}_{name_slug}",
+            f"{controller_slug}_{name_slug}",
+            f"hmpd_{controller_slug}_{name_ascii_slug}",
+            f"{controller_slug}_{name_ascii_slug}",
+            f"hmpd_{idx}",
+            idx,
+        }
+
+        return {s for s in suffixes if s and s != "hmpd_"}
+
+    def purge_legacy_topics_for_current_zones(self) -> None:
+        cleared = 0
+        for zone in self.zones.values():
+            for suffix in self.legacy_discovery_suffixes_for_zone(zone):
+                if suffix != f"hmpd_{zone.unique_id}":
+                    self._clear_discovery_topic(suffix)
+                    cleared += 1
+        log.info("Published retained cleanup for %s legacy discovery topic candidates", cleared)
 
     def sync_temps(self, controller: Controller) -> None:
         lines, timed_out = self.run_hmpd(controller, ["temps"], timeout=self.temps_timeout)
@@ -715,7 +758,6 @@ class HMPDBridge:
                 if timed_out:
                     raise RuntimeError(f"set timed out for {zone.unique_id}")
 
-                # immediate confirm refresh after a set
                 time.sleep(1)
                 self.sync_temps(controller)
                 self.sync_regs(controller)
@@ -755,6 +797,10 @@ class HMPDBridge:
 
         self.sync_all_temps()
         self.sync_all_regs()
+
+        if not self.legacy_cleanup_done:
+            self.purge_legacy_topics_for_current_zones()
+            self.legacy_cleanup_done = True
 
         self.last_regs_refresh = time.monotonic()
 
