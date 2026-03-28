@@ -55,6 +55,39 @@ RETAIN_STATE = True
 
 DEBUG_LOG_FILE = "/config/hmpd_bridge.log"
 
+# old/translated alias names that used to exist in HA and should be cleaned up
+LEGACY_ALIAS_NAMES = [
+    "Bar",
+    "Bazén L",
+    "Bazén P",
+    "Kancelář",
+    "Kancelář WC",
+    "Kuchyň",
+    "Před Saunou",
+    "Sál",
+    "Sauna",
+    "Schody",
+    "Sprchy Muži",
+    "Sprchy Ženy",
+    "Šatna",
+    "Šatna Personál",
+    "Šatna Personál Sprchy",
+    "Šatna Personál WC",
+    "Vatna",
+    "Vchod",
+    "WC Muži",
+    "WC Ženy",
+    "Zchlazovací Bazén",
+    "Pokoj 2",
+    "Pokoj 2 WC",
+    "Pokoj 3",
+    "Pokoj 3 WC",
+    "Pokoj 4",
+    "Pokoj 4 WC",
+    "Pokoj 5",
+    "Pokoj 5 WC",
+]
+
 
 def load_options() -> dict:
     try:
@@ -162,7 +195,7 @@ class HMPDBridge:
         self.last_regs_refresh = 0.0
         self.mqtt_connected = False
         self.cleanup_done = False
-        self.legacy_cleanup_done = False
+        self.alias_cleanup_done = False
 
         self.mqtt = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -534,7 +567,7 @@ class HMPDBridge:
             del self.zones[unique_id]
         log.info("Removed thermostat %s", unique_id)
 
-    def _clear_discovery_topic(self, suffix: str) -> None:
+    def _clear_discovery_suffix(self, suffix: str) -> None:
         topic = f"{self.discovery_prefix}/climate/{suffix}/config"
         self.mqtt.publish(topic, "", qos=1, retain=True)
 
@@ -554,38 +587,46 @@ class HMPDBridge:
 
         log.info("Published retained cleanup for all indexed topics")
 
-    def legacy_discovery_suffixes_for_zone(self, zone: Zone) -> Set[str]:
-        controller_slug = self.slugify(zone.controller_name)
+    def legacy_suffixes_for_zone(self, zone: Zone) -> Set[str]:
         name_raw = zone.zone_name.strip()
         name_slug = self.slugify(name_raw)
         name_ascii_slug = self.slugify_ascii(name_raw)
-        idx = str(zone.zone_index)
+        controller_slug = self.slugify(zone.controller_name)
 
         suffixes = {
-            f"hmpd_{zone.unique_id}",
-            zone.unique_id,
-            f"hmpd_{name_slug}",
             name_slug,
-            f"hmpd_{name_ascii_slug}",
             name_ascii_slug,
-            f"hmpd_{controller_slug}_{name_slug}",
+            f"hmpd_{name_slug}",
+            f"hmpd_{name_ascii_slug}",
             f"{controller_slug}_{name_slug}",
-            f"hmpd_{controller_slug}_{name_ascii_slug}",
             f"{controller_slug}_{name_ascii_slug}",
-            f"hmpd_{idx}",
-            idx,
+            f"hmpd_{controller_slug}_{name_slug}",
+            f"hmpd_{controller_slug}_{name_ascii_slug}",
         }
+        return {s for s in suffixes if s and s != f"hmpd_{zone.unique_id}"}
 
-        return {s for s in suffixes if s and s != "hmpd_"}
-
-    def purge_legacy_topics_for_current_zones(self) -> None:
+    def purge_alias_topics(self) -> None:
         cleared = 0
+
         for zone in self.zones.values():
-            for suffix in self.legacy_discovery_suffixes_for_zone(zone):
-                if suffix != f"hmpd_{zone.unique_id}":
-                    self._clear_discovery_topic(suffix)
+            for suffix in self.legacy_suffixes_for_zone(zone):
+                self._clear_discovery_suffix(suffix)
+                cleared += 1
+
+        for alias in LEGACY_ALIAS_NAMES:
+            alias_slug = self.slugify(alias)
+            alias_ascii_slug = self.slugify_ascii(alias)
+            for suffix in {
+                alias_slug,
+                alias_ascii_slug,
+                f"hmpd_{alias_slug}",
+                f"hmpd_{alias_ascii_slug}",
+            }:
+                if suffix:
+                    self._clear_discovery_suffix(suffix)
                     cleared += 1
-        log.info("Published retained cleanup for %s legacy discovery topic candidates", cleared)
+
+        log.info("Published retained cleanup for %s legacy alias topic candidates", cleared)
 
     def sync_temps(self, controller: Controller) -> None:
         lines, timed_out = self.run_hmpd(controller, ["temps"], timeout=self.temps_timeout)
@@ -665,9 +706,8 @@ class HMPDBridge:
                         zone.pending_target = None
                 updated += 1
 
-            if not zone.discovered:
-                self.publish_discovery(zone)
-
+            # always republish discovery so missing entities come back
+            self.publish_discovery(zone)
             self.publish_state(zone)
 
         stale_ids = [
@@ -798,9 +838,11 @@ class HMPDBridge:
         self.sync_all_temps()
         self.sync_all_regs()
 
-        if not self.legacy_cleanup_done:
-            self.purge_legacy_topics_for_current_zones()
-            self.legacy_cleanup_done = True
+        if not self.alias_cleanup_done:
+            self.purge_alias_topics()
+            time.sleep(2)
+            self.sync_all_regs()
+            self.alias_cleanup_done = True
 
         self.last_regs_refresh = time.monotonic()
 
