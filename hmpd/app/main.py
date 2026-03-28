@@ -184,6 +184,8 @@ class HMPDBridge:
 
         self.hmpd_path = ""
         self.stdbuf_path = shutil.which("stdbuf")
+        self.initial_sync_done = False
+        self.suppress_empty_command_logs = False
 
     def normalize_ascii(self, value: str) -> str:
         return unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
@@ -471,8 +473,9 @@ class HMPDBridge:
         if str(reason_code) == "Success":
             self.mqtt_connected = True
             log.info("Connected to MQTT broker %s:%s", self.mqtt_host, self.mqtt_port)
-            client.subscribe(f"{self.base_topic}/+/set_target")
             client.subscribe(f"{self.base_topic}/bridge/resync")
+            if self.initial_sync_done:
+                client.subscribe(f"{self.base_topic}/+/set_target")
         else:
             self.mqtt_connected = False
             log.error("MQTT authorization/connection failed: %s", reason_code)
@@ -500,7 +503,7 @@ class HMPDBridge:
             zone_key = m.group(1)
 
             if not payload:
-                if DEBUG:
+                if DEBUG and not self.suppress_empty_command_logs:
                     log.debug("Ignoring empty target payload for %s", zone_key)
                 return
 
@@ -872,14 +875,18 @@ class HMPDBridge:
                 log.error("sync_temps failed for %s: %s", controller.name, exc)
 
     def force_full_republish(self) -> None:
-        self.scan_and_cleanup_discovery_topics()
-        self.cleanup_all_retained_topics()
-        self.cleanup_legacy_alias_topics()
-        self.zones = {}
-        self.latest_temps = {}
-        self.latest_regs = {}
-        self.sync_all_temps()
-        self.sync_all_regs()
+        self.suppress_empty_command_logs = True
+        try:
+            self.scan_and_cleanup_discovery_topics()
+            self.cleanup_all_retained_topics()
+            self.cleanup_legacy_alias_topics()
+            self.zones = {}
+            self.latest_temps = {}
+            self.latest_regs = {}
+            self.sync_all_temps()
+            self.sync_all_regs()
+        finally:
+            self.suppress_empty_command_logs = False
 
     def set_zone_target(self, zone: Zone, target: float) -> None:
         controller = self.controllers_by_name.get(zone.controller_name)
@@ -914,6 +921,8 @@ class HMPDBridge:
         self.mqtt_connect_loop()
         self.publish_bridge_status(True)
         self.force_full_republish()
+        self.initial_sync_done = True
+        self.mqtt.subscribe(f"{self.base_topic}/+/set_target")
         self.last_regs_refresh = time.monotonic()
 
         while True:
