@@ -519,7 +519,7 @@ class HMPDBridge:
                 log.warning("Invalid target payload for %s: %s", zone_key, payload)
                 return
 
-            value = self.snap_target_temp(value)
+            value = round(max(self.temp_min, min(self.temp_max, value)), 1)
             self.set_zone_target(zone, value)
         except Exception as exc:
             log.error("MQTT message handling failed for topic %s: %s", topic, exc)
@@ -587,12 +587,6 @@ class HMPDBridge:
     def valid_current_temp(self, value: float) -> bool:
         return CURRENT_TEMP_MIN < value < CURRENT_TEMP_MAX
 
-    def snap_target_temp(self, value: float) -> float:
-        value = max(self.temp_min, min(self.temp_max, value))
-        steps = round((value - self.temp_min) / self.temp_step)
-        snapped = self.temp_min + (steps * self.temp_step)
-        return round(max(self.temp_min, min(self.temp_max, snapped)), 1)
-
     def parse_regs(self, controller: Controller, lines: List[str]) -> Dict[int, dict]:
         parsed: Dict[int, dict] = {}
 
@@ -620,7 +614,7 @@ class HMPDBridge:
                 target_temp = None
                 if m_tgt:
                     raw_tgt = float(m_tgt.group(1))
-                    target_temp = self.snap_target_temp(raw_tgt)
+                    target_temp = round(max(self.temp_min, min(self.temp_max, raw_tgt)), 1)
 
                 enabled = "EN" in parts[4]
 
@@ -796,7 +790,6 @@ class HMPDBridge:
         created = 0
         updated = 0
         skipped_no_temp = 0
-        used_regs_temp = 0
         valid_unique_ids: Set[str] = set()
 
         seen_zone_names: Dict[str, int] = {}
@@ -806,14 +799,11 @@ class HMPDBridge:
             if not name:
                 continue
 
-            current_temp = temps.get(idx)
-            if current_temp is None:
-                current_temp = data.get("current_temp")
-                if current_temp is None:
-                    skipped_no_temp += 1
-                    continue
-                used_regs_temp += 1
+            if idx not in temps:
+                skipped_no_temp += 1
+                continue
 
+            current_temp = temps[idx]
             unique_id = self.zone_unique_id(controller, idx)
             valid_unique_ids.add(unique_id)
             zone = self.zones.get(unique_id)
@@ -862,12 +852,11 @@ class HMPDBridge:
             )
 
         log.info(
-            "Synced regs for %s (%s created, %s updated, %s skipped_no_temp, %s used_regs_temp)%s",
+            "Synced regs for %s (%s created, %s updated, %s skipped_no_temp)%s",
             controller.name,
             created,
             updated,
             skipped_no_temp,
-            used_regs_temp,
             " (partial)" if is_partial else "",
         )
 
@@ -894,10 +883,8 @@ class HMPDBridge:
             self.zones = {}
             self.latest_temps = {}
             self.latest_regs = {}
-            # Regs already contain names, targets, and often a valid current temp.
-            # Sync them first so entities appear immediately even if temps is slow.
-            self.sync_all_regs()
             self.sync_all_temps()
+            self.sync_all_regs()
         finally:
             self.suppress_empty_command_logs = False
 
