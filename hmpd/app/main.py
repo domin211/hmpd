@@ -8,7 +8,6 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from queue import Empty, Queue
 from typing import Dict, List, Optional, Tuple
 
 import paho.mqtt.client as mqtt
@@ -31,14 +30,15 @@ CONTROLLERS = [
     {"name": "usb1", "dev": "/dev/ttyUSB1", "baud": 4800},
 ]
 
+# current temperature refresh
 POLL_INTERVAL = 60
+
+# full regs / names / targets refresh
 REG_REFRESH_INTERVAL = 600
 
-TEMPS_TIMEOUT = 20
-REGS_TIMEOUT = 60
-REGS_RETRIES = 2
-SET_TIMEOUT = 12
-SET_DELAY_SECONDS = 5
+TEMPS_TIMEOUT = 15
+REGS_TIMEOUT = 20
+SET_TIMEOUT = 8
 
 TEMP_MIN = 16.0
 TEMP_MAX = 32.0
@@ -115,7 +115,6 @@ class Zone:
     target_temp: Optional[float] = None
     enabled: Optional[bool] = None
     discovered: bool = False
-    pending_target: Optional[float] = None
 
 
 class HMPDBridge:
@@ -134,9 +133,7 @@ class HMPDBridge:
         self.reg_refresh_interval = REG_REFRESH_INTERVAL
         self.temps_timeout = TEMPS_TIMEOUT
         self.regs_timeout = REGS_TIMEOUT
-        self.regs_retries = REGS_RETRIES
         self.set_timeout = SET_TIMEOUT
-        self.set_delay_seconds = SET_DELAY_SECONDS
         self.temp_min = TEMP_MIN
         self.temp_max = TEMP_MAX
         self.temp_step = TEMP_STEP
@@ -155,9 +152,6 @@ class HMPDBridge:
         self.zones: Dict[str, Zone] = {}
         self.latest_temps: Dict[str, Dict[int, float]] = {}
         self.command_lock = threading.Lock()
-        self.state_lock = threading.Lock()
-        self.set_queue: Queue[Tuple[str, float]] = Queue()
-        self.queued_targets: Dict[str, float] = {}
         self.last_regs_refresh = 0.0
         self.mqtt_connected = False
 
@@ -181,10 +175,6 @@ class HMPDBridge:
 
     def zone_unique_id(self, controller_name: str, zone_index: int) -> str:
         return f"{self.slugify(controller_name)}_{int(zone_index)}"
-
-    def clamp_target(self, value: float) -> float:
-        value = max(self.temp_min, min(self.temp_max, float(value)))
-        return round(value * 2.0) / 2.0
 
     def hmpd_candidates(self) -> List[str]:
         candidates = [
@@ -266,6 +256,11 @@ class HMPDBridge:
         self.mqtt_connected = False
         log.warning("MQTT disconnected (reason=%s)", reason_code)
 
+    def round_to_step(self, value: float) -> float:
+        stepped = round(value / self.temp_step) * self.temp_step
+        stepped = max(self.temp_min, min(self.temp_max, stepped))
+        return round(stepped, 1)
+
     def on_message(self, client, userdata, msg):
         topic = msg.topic
         payload = msg.payload.decode("utf-8", errors="ignore").strip()
@@ -295,8 +290,8 @@ class HMPDBridge:
                 log.warning("Invalid target payload for %s: %s", zone_key, payload)
                 return
 
-            value = self.clamp_target(value)
-            self.queue_zone_target(zone, value)
+            value = self.round_to_step(value)
+            self.set_zone_target(zone, value)
         except Exception as exc:
             log.error("MQTT message handling failed for topic %s: %s", topic, exc)
 
@@ -345,41 +340,20 @@ class HMPDBridge:
         lines = [line.strip() for line in stdout.splitlines() if line.strip()]
 
         if timed_out:
-            return lines, True
+            if action_args and action_args[0] == "regs" and lines:
+                log.warning(
+                    "hmpd regs timed out for %s, using partial output (%s lines)",
+                    controller.name,
+                    len(lines),
+                )
+                return lines, True
+
+            raise RuntimeError(f"Command {cmd!r} timed out after {timeout} seconds")
 
         if proc.returncode != 0:
             raise RuntimeError(f"hmpd exited {proc.returncode}: {stderr.strip() or stdout.strip()}")
 
         return lines, False
-
-    def run_regs_full(self, controller: Controller) -> List[str]:
-        last_lines: List[str] = []
-
-        for attempt in range(1, self.regs_retries + 2):
-            lines, timed_out = self.run_hmpd(controller, ["regs"], timeout=self.regs_timeout)
-            last_lines = lines
-
-            if not timed_out:
-                log.info(
-                    "Got full regs for %s on attempt %s (%s lines)",
-                    controller.name,
-                    attempt,
-                    len(lines),
-                )
-                return lines
-
-            log.warning(
-                "regs timed out for %s on attempt %s/%s (%s partial lines), retrying",
-                controller.name,
-                attempt,
-                self.regs_retries + 1,
-                len(lines),
-            )
-            time.sleep(2)
-
-        raise RuntimeError(
-            f"Could not get full regs for {controller.name}; last partial result had {len(last_lines)} lines"
-        )
 
     def valid_current_temp(self, value: float) -> bool:
         return CURRENT_TEMP_MIN < value < CURRENT_TEMP_MAX
@@ -396,6 +370,7 @@ class HMPDBridge:
 
                 idx = int(parts[0].strip())
                 name = parts[1].strip()
+
                 if not name:
                     continue
 
@@ -411,7 +386,7 @@ class HMPDBridge:
                 target_temp = None
                 if m_tgt:
                     raw_tgt = float(m_tgt.group(1))
-                    target_temp = self.clamp_target(raw_tgt)
+                    target_temp = self.round_to_step(raw_tgt)
 
                 enabled = "EN" in parts[4]
 
@@ -466,11 +441,6 @@ class HMPDBridge:
 
         return parsed
 
-    def calculate_mode(self, zone: Zone) -> str:
-        if zone.current_temp is None or zone.target_temp is None:
-            return "off"
-        return "heat" if zone.target_temp > zone.current_temp else "off"
-
     def discovery_payload(self, zone: Zone) -> dict:
         state_topic = f"{self.base_topic}/{zone.unique_id}/state"
         command_topic = f"{self.base_topic}/{zone.unique_id}/set_target"
@@ -485,7 +455,7 @@ class HMPDBridge:
             "temperature_command_topic": command_topic,
             "mode_state_topic": state_topic,
             "mode_state_template": "{{ value_json.mode }}",
-            "modes": ["off", "heat"],
+            "modes": ["heat"],
             "min_temp": self.temp_min,
             "max_temp": self.temp_max,
             "temp_step": self.temp_step,
@@ -494,6 +464,7 @@ class HMPDBridge:
                 "name": zone.zone_name,
                 "manufacturer": "HMPD",
                 "model": "Thermostat Regulator",
+                "via_device": f"hmpd_bridge_{self.slugify(zone.controller_name)}",
             },
         }
 
@@ -508,18 +479,36 @@ class HMPDBridge:
         payload = {
             "current_temp": zone.current_temp if zone.current_temp is not None else self.temp_min,
             "target_temp": zone.target_temp if zone.target_temp is not None else self.temp_min,
-            "mode": self.calculate_mode(zone),
-            "pending_target": zone.pending_target,
+            "mode": "heat",
         }
         self.mqtt.publish(topic, json.dumps(payload), qos=1, retain=self.retain_state)
 
-    def sync_temps(self, controller: Controller) -> None:
-        lines, timed_out = self.run_hmpd(controller, ["temps"], timeout=self.temps_timeout)
-        if timed_out:
-            raise RuntimeError(f"temps timed out for {controller.name}")
+    def remove_zone(self, unique_id: str) -> None:
+        discovery_topic = f"{self.discovery_prefix}/climate/hmpd_{unique_id}/config"
+        state_topic = f"{self.base_topic}/{unique_id}/state"
+        self.mqtt.publish(discovery_topic, "", qos=1, retain=True)
+        self.mqtt.publish(state_topic, "", qos=1, retain=True)
+        if unique_id in self.zones:
+            del self.zones[unique_id]
+        log.info("Removed thermostat %s", unique_id)
 
+    def sync_temps(self, controller: Controller) -> None:
+        lines, _ = self.run_hmpd(controller, ["temps"], timeout=self.temps_timeout)
         temps = self.parse_temps(controller, lines)
         self.latest_temps[controller.name] = temps
+
+        current_valid_ids = {
+            self.zone_unique_id(controller.name, idx)
+            for idx in temps.keys()
+        }
+
+        to_remove = [
+            unique_id
+            for unique_id, zone in list(self.zones.items())
+            if zone.controller_name == controller.name and unique_id not in current_valid_ids
+        ]
+        for unique_id in to_remove:
+            self.remove_zone(unique_id)
 
         updated = 0
         for idx, current_temp in temps.items():
@@ -543,10 +532,11 @@ class HMPDBridge:
         )
 
     def sync_regs(self, controller: Controller) -> None:
-        lines = self.run_regs_full(controller)
+        lines, is_partial = self.run_hmpd(controller, ["regs"], timeout=self.regs_timeout)
         parsed = self.parse_regs(controller, lines)
         temps = self.latest_temps.get(controller.name, {})
 
+        valid_zone_ids = set()
         created = 0
         updated = 0
         skipped_no_temp = 0
@@ -562,6 +552,8 @@ class HMPDBridge:
 
             current_temp = temps[idx]
             unique_id = self.zone_unique_id(controller.name, idx)
+            valid_zone_ids.add(unique_id)
+
             zone = self.zones.get(unique_id)
 
             if zone is None:
@@ -584,9 +576,6 @@ class HMPDBridge:
                 if data["target_temp"] is not None:
                     zone.target_temp = data["target_temp"]
                 zone.enabled = data["enabled"]
-                if zone.pending_target is not None and zone.target_temp is not None:
-                    if abs(zone.pending_target - zone.target_temp) < 0.01:
-                        zone.pending_target = None
                 updated += 1
 
             if not zone.discovered:
@@ -594,12 +583,21 @@ class HMPDBridge:
 
             self.publish_state(zone)
 
+        stale_ids = [
+            unique_id
+            for unique_id, zone in list(self.zones.items())
+            if zone.controller_name == controller.name and unique_id not in valid_zone_ids
+        ]
+        for unique_id in stale_ids:
+            self.remove_zone(unique_id)
+
         log.info(
-            "Synced regs for %s (%s created, %s updated, %s skipped_no_temp)",
+            "Synced regs for %s (%s created, %s updated, %s skipped_no_temp)%s",
             controller.name,
             created,
             updated,
             skipped_no_temp,
+            " (partial)" if is_partial else "",
         )
 
     def sync_all_regs(self) -> None:
@@ -616,84 +614,30 @@ class HMPDBridge:
             except Exception as exc:
                 log.error("sync_temps failed for %s: %s", controller.name, exc)
 
-    def queue_zone_target(self, zone: Zone, target: float) -> None:
-        with self.state_lock:
-            current_target = zone.target_temp
-            pending_target = zone.pending_target
+    def set_zone_target(self, zone: Zone, target: float) -> None:
+        controller = self.controllers_by_name.get(zone.controller_name)
+        if controller is None:
+            log.error("Unknown controller for zone %s", zone.unique_id)
+            return
 
-            if current_target is not None and abs(current_target - target) < 0.01 and pending_target is None:
-                log.info("Ignoring set for %s, already at %.1f", zone.unique_id, target)
-                return
-
-            if pending_target is not None and abs(pending_target - target) < 0.01:
-                log.info("Ignoring duplicate queued set for %s -> %.1f", zone.unique_id, target)
-                return
-
-            zone.pending_target = target
-            self.queued_targets[zone.unique_id] = target
+        try:
+            target = self.round_to_step(target)
+            self.run_hmpd(
+                controller,
+                ["set", str(zone.zone_index), f"{target:.1f}"],
+                timeout=self.set_timeout,
+            )
+            zone.target_temp = target
             self.publish_state(zone)
-
-        self.set_queue.put((zone.unique_id, target))
-        log.info("Queued %s (%s) -> %.1f", zone.zone_name, zone.unique_id, target)
-
-    def set_worker(self) -> None:
-        while True:
-            try:
-                zone_unique_id, queued_target = self.set_queue.get(timeout=1)
-            except Empty:
-                continue
-
-            try:
-                zone = self.zones.get(zone_unique_id)
-                if zone is None:
-                    continue
-
-                with self.state_lock:
-                    latest_target = self.queued_targets.get(zone_unique_id)
-
-                if latest_target is None or abs(latest_target - queued_target) >= 0.01:
-                    log.info(
-                        "Skipping stale queued set for %s -> %.1f (latest=%s)",
-                        zone_unique_id,
-                        queued_target,
-                        latest_target,
-                    )
-                    continue
-
-                controller = self.controllers_by_name.get(zone.controller_name)
-                if controller is None:
-                    log.error("Unknown controller for zone %s", zone.unique_id)
-                    continue
-
-                log.info("Applying queued set for %s (%s) -> %.1f", zone.zone_name, zone.unique_id, queued_target)
-                _, timed_out = self.run_hmpd(
-                    controller,
-                    ["set", str(zone.zone_index), f"{queued_target:.1f}"],
-                    timeout=self.set_timeout,
-                )
-                if timed_out:
-                    raise RuntimeError(f"set timed out for {zone.unique_id}")
-
-                time.sleep(1)
-                self.sync_temps(controller)
-                self.sync_regs(controller)
-
-                with self.state_lock:
-                    latest_after_sync = self.queued_targets.get(zone_unique_id)
-                    if latest_after_sync is not None and abs(latest_after_sync - queued_target) < 0.01:
-                        self.queued_targets.pop(zone_unique_id, None)
-                        zone = self.zones.get(zone_unique_id)
-                        if zone and zone.pending_target is not None and zone.target_temp is not None:
-                            if abs(zone.pending_target - zone.target_temp) < 0.01:
-                                zone.pending_target = None
-                                self.publish_state(zone)
-
-                log.info("Finished queued set for %s (%s) -> %.1f", zone.zone_name, zone.unique_id, queued_target)
-            except Exception as exc:
-                log.error("Failed queued set for %s -> %.1f: %s", zone_unique_id, queued_target, exc)
-            finally:
-                self.set_queue.task_done()
-                time.sleep(self.set_delay_seconds)
+            log.info("Set %s (%s) to %.1f", zone.zone_name, zone.unique_id, target)
+        except Exception as exc:
+            log.error(
+                "Failed to set %s (%s) to %.1f: %s",
+                zone.zone_name,
+                zone.unique_id,
+                target,
+                exc,
+            )
 
     def start(self):
         self.find_hmpd()
@@ -701,18 +645,19 @@ class HMPDBridge:
         for controller in self.controllers:
             log.info("Configured controller %s -> %s @ %s", controller.name, controller.dev, controller.baud)
 
-        worker = threading.Thread(target=self.set_worker, daemon=True)
-        worker.start()
-
         self.mqtt_connect_loop()
 
+        # First temps so we know which zones have valid current temperature.
         self.sync_all_temps()
+
+        # Then regs so we create only named zones with valid current temperature.
         self.sync_all_regs()
 
         self.last_regs_refresh = time.monotonic()
 
         while True:
             now = time.monotonic()
+
             if now - self.last_regs_refresh >= self.reg_refresh_interval:
                 self.sync_all_regs()
                 self.last_regs_refresh = now
