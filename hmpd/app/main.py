@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -30,10 +31,10 @@ CONTROLLERS = [
     {"name": "usb1", "dev": "/dev/ttyUSB1", "baud": 4800},
 ]
 
-# valid current temp polling
-POLL_INTERVAL = 10
+# Current temperatures every minute.
+POLL_INTERVAL = 60
 
-# slower regs/name/target refresh
+# Full regs/name/target refresh every 10 minutes.
 REG_REFRESH_INTERVAL = 600
 
 TEMPS_TIMEOUT = 15
@@ -53,7 +54,7 @@ RETAIN_DISCOVERY = True
 RETAIN_STATE = True
 
 DEBUG_LOG_FILE = "/config/hmpd_bridge.log"
-MAX_ZONE_INDEX_CLEANUP = 64
+MAX_ZONE_INDEX = 64
 
 
 def load_options() -> dict:
@@ -73,7 +74,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("hmpd_bridge")
-
 
 
 def append_debug_file(message: str) -> None:
@@ -156,7 +156,6 @@ class HMPDBridge:
         self.command_lock = threading.Lock()
         self.last_regs_refresh = 0.0
         self.mqtt_connected = False
-        self.did_full_cleanup = False
 
         self.mqtt = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -170,8 +169,11 @@ class HMPDBridge:
         self.hmpd_path = ""
         self.stdbuf_path = shutil.which("stdbuf")
 
+    def normalize_ascii(self, value: str) -> str:
+        return unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+
     def slugify(self, value: str) -> str:
-        value = value.strip().lower()
+        value = self.normalize_ascii(value).strip().lower()
         value = re.sub(r"[^a-z0-9]+", "_", value)
         value = re.sub(r"_+", "_", value).strip("_")
         return value or "zone"
@@ -187,6 +189,95 @@ class HMPDBridge:
 
     def discovery_topic(self, unique_id: str) -> str:
         return f"{self.discovery_prefix}/climate/hmpd_{unique_id}/config"
+
+    def cleanup_unique_id(self, unique_id: str) -> None:
+        self.mqtt.publish(self.discovery_topic(unique_id), "", qos=1, retain=True)
+        self.mqtt.publish(self.state_topic(unique_id), "", qos=1, retain=True)
+
+    def zone_alias_candidates(self, controller: Controller, idx: int, name: str) -> Set[str]:
+        """Best-effort cleanup of old retained discovery topics from previous buggy versions."""
+        base_name = name.strip()
+        ascii_name = self.normalize_ascii(base_name)
+        name_slug = self.slugify(base_name)
+        ascii_slug = self.slugify(ascii_name)
+        ctrl_slug = self.slugify(controller.name)
+
+        raw_variants = {
+            base_name,
+            ascii_name,
+            base_name.lower(),
+            ascii_name.lower(),
+            re.sub(r"\s+", " ", base_name),
+            re.sub(r"\s+", " ", ascii_name),
+        }
+
+        candidates: Set[str] = {
+            self.zone_unique_id(controller.name, idx),
+            f"{ctrl_slug}_{idx}_{name_slug}",
+            f"{ctrl_slug}_{idx}_{ascii_slug}",
+            f"{ctrl_slug}_{name_slug}",
+            f"{ctrl_slug}_{ascii_slug}",
+            f"{ctrl_slug}_{name_slug}_{idx}",
+            f"{ctrl_slug}_{ascii_slug}_{idx}",
+            f"{name_slug}",
+            f"{ascii_slug}",
+            f"zone_{idx}",
+            str(idx),
+        }
+
+        for raw in raw_variants:
+            raw_slug = self.slugify(raw)
+            candidates.add(raw_slug)
+            candidates.add(f"{ctrl_slug}_{raw_slug}")
+            candidates.add(f"{ctrl_slug}_{idx}_{raw_slug}")
+            candidates.add(f"{ctrl_slug}_{raw_slug}_{idx}")
+
+        return {c for c in candidates if c}
+
+    def cleanup_all_retained_topics(self) -> None:
+        candidates: Set[str] = set()
+
+        for controller in self.controllers:
+            for idx in range(MAX_ZONE_INDEX):
+                candidates.add(self.zone_unique_id(controller.name, idx))
+
+        for unique_id in list(self.zones.keys()):
+            candidates.add(unique_id)
+
+        for unique_id in sorted(candidates):
+            self.cleanup_unique_id(unique_id)
+
+        log.info("Published retained cleanup for all indexed topics")
+
+    def cleanup_legacy_alias_topics(self) -> None:
+        candidates: Set[str] = set()
+
+        for controller in self.controllers:
+            try:
+                lines, _ = self.run_hmpd(controller, ["regs"], timeout=self.regs_timeout)
+                parsed = self.parse_regs(controller, lines)
+                for idx, data in parsed.items():
+                    name = (data.get("name") or "").strip()
+                    if not name:
+                        continue
+                    candidates.update(self.zone_alias_candidates(controller, idx, name))
+            except Exception as exc:
+                log.warning("Legacy alias cleanup scan failed for %s: %s", controller.name, exc)
+
+        # A few extra generic leftovers from older broken versions.
+        generic = {
+            "unnamed_device",
+            "thermostat_regulator",
+            "hmpd",
+            "usb0",
+            "usb1",
+        }
+        candidates.update(generic)
+
+        for unique_id in sorted(candidates):
+            self.cleanup_unique_id(unique_id)
+
+        log.info("Published retained cleanup for %s legacy alias topic candidates", len(candidates))
 
     def hmpd_candidates(self) -> List[str]:
         candidates = [
@@ -455,6 +546,9 @@ class HMPDBridge:
             "name": zone.zone_name,
             "object_id": object_id,
             "unique_id": object_id,
+            "availability_topic": f"{self.base_topic}/bridge/status",
+            "payload_available": "online",
+            "payload_not_available": "offline",
             "current_temperature_topic": state_topic,
             "current_temperature_template": "{{ value_json.current_temp }}",
             "temperature_state_topic": state_topic,
@@ -475,6 +569,15 @@ class HMPDBridge:
             },
         }
 
+    def publish_bridge_status(self, online: bool) -> None:
+        payload = "online" if online else "offline"
+        self.mqtt.publish(
+            f"{self.base_topic}/bridge/status",
+            payload,
+            qos=1,
+            retain=True,
+        )
+
     def publish_discovery(self, zone: Zone) -> None:
         topic = self.discovery_topic(zone.unique_id)
         payload = self.discovery_payload(zone)
@@ -489,24 +592,6 @@ class HMPDBridge:
             "mode": "heat",
         }
         self.mqtt.publish(topic, json.dumps(payload), qos=1, retain=self.retain_state)
-
-    def cleanup_unique_id(self, unique_id: str) -> None:
-        self.mqtt.publish(self.discovery_topic(unique_id), "", qos=1, retain=True)
-        self.mqtt.publish(self.state_topic(unique_id), "", qos=1, retain=True)
-
-    def cleanup_all_retained_topics(self) -> None:
-        candidates: Set[str] = set()
-
-        for controller in self.controllers:
-            for idx in range(MAX_ZONE_INDEX_CLEANUP):
-                candidates.add(self.zone_unique_id(controller.name, idx))
-
-        candidates.update(self.zones.keys())
-
-        for unique_id in sorted(candidates):
-            self.cleanup_unique_id(unique_id)
-
-        log.info("Published retained cleanup for all indexed topics")
 
     def remove_zone(self, unique_id: str) -> None:
         self.cleanup_unique_id(unique_id)
@@ -635,6 +720,7 @@ class HMPDBridge:
 
     def force_full_republish(self) -> None:
         self.cleanup_all_retained_topics()
+        self.cleanup_legacy_alias_topics()
         self.zones = {}
         self.latest_temps = {}
         self.sync_all_temps()
@@ -671,9 +757,8 @@ class HMPDBridge:
             log.info("Configured controller %s -> %s @ %s", controller.name, controller.dev, controller.baud)
 
         self.mqtt_connect_loop()
-
+        self.publish_bridge_status(True)
         self.force_full_republish()
-        self.did_full_cleanup = True
         self.last_regs_refresh = time.monotonic()
 
         while True:
