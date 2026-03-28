@@ -8,8 +8,9 @@ import subprocess
 import threading
 import time
 import unicodedata
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import paho.mqtt.client as mqtt
 
@@ -39,7 +40,9 @@ REG_REFRESH_INTERVAL = 600
 
 TEMPS_TIMEOUT = 15
 REGS_TIMEOUT = 20
-SET_TIMEOUT = 8
+SET_TIMEOUT = 20
+SET_RETRY_DELAY_SECONDS = 5
+SET_MAX_ATTEMPTS = 3
 
 TEMP_MIN = 16.0
 TEMP_MAX = 32.0
@@ -171,6 +174,15 @@ class HMPDBridge:
         self.command_lock = threading.Lock()
         self.last_regs_refresh = 0.0
         self.mqtt_connected = False
+        self.set_retry_delay_seconds = SET_RETRY_DELAY_SECONDS
+        self.set_max_attempts = SET_MAX_ATTEMPTS
+        self.write_queue_lock = threading.Lock()
+        self.write_queue_cv = threading.Condition(self.write_queue_lock)
+        self.write_queues: Dict[str, Deque[Tuple[str, float]]] = {
+            controller.key: deque() for controller in self.controllers
+        }
+        self.pending_targets: Dict[str, float] = {}
+        self.write_workers_started = False
 
         self.mqtt = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -466,6 +478,7 @@ class HMPDBridge:
             self.mqtt.loop_stop()
         except Exception:
             pass
+        self.start_write_workers()
         self.mqtt_connect_loop()
         self.publish_bridge_status(True)
 
@@ -519,8 +532,8 @@ class HMPDBridge:
                 log.warning("Invalid target payload for %s: %s", zone_key, payload)
                 return
 
-            value = round(max(self.temp_min, min(self.temp_max, value)), 1)
-            self.set_zone_target(zone, value)
+            value = self.snap_target_temp(value)
+            self.enqueue_set_target(zone, value)
         except Exception as exc:
             log.error("MQTT message handling failed for topic %s: %s", topic, exc)
 
@@ -587,6 +600,12 @@ class HMPDBridge:
     def valid_current_temp(self, value: float) -> bool:
         return CURRENT_TEMP_MIN < value < CURRENT_TEMP_MAX
 
+    def snap_target_temp(self, value: float) -> float:
+        value = max(self.temp_min, min(self.temp_max, value))
+        steps = round((value - self.temp_min) / self.temp_step)
+        snapped = self.temp_min + (steps * self.temp_step)
+        return round(max(self.temp_min, min(self.temp_max, snapped)), 1)
+
     def parse_regs(self, controller: Controller, lines: List[str]) -> Dict[int, dict]:
         parsed: Dict[int, dict] = {}
 
@@ -614,7 +633,7 @@ class HMPDBridge:
                 target_temp = None
                 if m_tgt:
                     raw_tgt = float(m_tgt.group(1))
-                    target_temp = round(max(self.temp_min, min(self.temp_max, raw_tgt)), 1)
+                    target_temp = self.snap_target_temp(raw_tgt)
 
                 enabled = "EN" in parts[4]
 
@@ -790,6 +809,7 @@ class HMPDBridge:
         created = 0
         updated = 0
         skipped_no_temp = 0
+        used_regs_temp = 0
         valid_unique_ids: Set[str] = set()
 
         seen_zone_names: Dict[str, int] = {}
@@ -799,11 +819,14 @@ class HMPDBridge:
             if not name:
                 continue
 
-            if idx not in temps:
-                skipped_no_temp += 1
-                continue
+            current_temp = temps.get(idx)
+            if current_temp is None:
+                current_temp = data.get("current_temp")
+                if current_temp is None:
+                    skipped_no_temp += 1
+                    continue
+                used_regs_temp += 1
 
-            current_temp = temps[idx]
             unique_id = self.zone_unique_id(controller, idx)
             valid_unique_ids.add(unique_id)
             zone = self.zones.get(unique_id)
@@ -852,11 +875,12 @@ class HMPDBridge:
             )
 
         log.info(
-            "Synced regs for %s (%s created, %s updated, %s skipped_no_temp)%s",
+            "Synced regs for %s (%s created, %s updated, %s skipped_no_temp, %s used_regs_temp)%s",
             controller.name,
             created,
             updated,
             skipped_no_temp,
+            used_regs_temp,
             " (partial)" if is_partial else "",
         )
 
@@ -874,6 +898,59 @@ class HMPDBridge:
             except Exception as exc:
                 log.error("sync_temps failed for %s: %s", controller.name, exc)
 
+    def refresh_zone_from_regs(self, controller: Controller, zone_index: int) -> Optional[Zone]:
+        try:
+            lines, _ = self.run_hmpd(controller, ["regs"], timeout=self.regs_timeout)
+            parsed = self.parse_regs(controller, lines)
+            self.latest_regs[controller.key] = parsed
+        except Exception as exc:
+            log.warning(
+                "Post-set verification regs refresh failed for %s zone %s: %s",
+                controller.name,
+                zone_index,
+                exc,
+            )
+            return self.zones.get(self.zone_unique_id(controller, zone_index))
+
+        data = parsed.get(zone_index)
+        if not data:
+            return self.zones.get(self.zone_unique_id(controller, zone_index))
+
+        unique_id = self.zone_unique_id(controller, zone_index)
+        zone = self.zones.get(unique_id)
+        if zone is None:
+            name = (data.get("name") or "").strip()
+            if not name:
+                return None
+            current_temp = self.latest_temps.get(controller.key, {}).get(zone_index, data.get("current_temp"))
+            if current_temp is None:
+                return None
+            zone = Zone(
+                controller_name=controller.name,
+                controller_key=controller.key,
+                controller_dev=controller.dev,
+                zone_index=zone_index,
+                zone_name=name,
+                unique_id=unique_id,
+                current_temp=current_temp,
+                target_temp=data.get("target_temp"),
+                enabled=data.get("enabled"),
+                discovered=False,
+            )
+            self.zones[unique_id] = zone
+        else:
+            zone.zone_name = (data.get("name") or zone.zone_name).strip() or zone.zone_name
+            current_temp = self.latest_temps.get(controller.key, {}).get(zone_index, data.get("current_temp"))
+            if current_temp is not None:
+                zone.current_temp = current_temp
+            if data.get("target_temp") is not None:
+                zone.target_temp = data["target_temp"]
+            zone.enabled = data.get("enabled")
+
+        self.publish_discovery(zone)
+        self.publish_state(zone)
+        return zone
+
     def force_full_republish(self) -> None:
         self.suppress_empty_command_logs = True
         try:
@@ -883,34 +960,148 @@ class HMPDBridge:
             self.zones = {}
             self.latest_temps = {}
             self.latest_regs = {}
-            self.sync_all_temps()
+            # Regs already contain names, targets, and often a valid current temp.
+            # Sync them first so entities appear immediately even if temps is slow.
             self.sync_all_regs()
+            self.sync_all_temps()
         finally:
             self.suppress_empty_command_logs = False
 
-    def set_zone_target(self, zone: Zone, target: float) -> None:
+    def start_write_workers(self) -> None:
+        if self.write_workers_started:
+            return
+        self.write_workers_started = True
+        for controller in self.controllers:
+            thread = threading.Thread(
+                target=self.write_worker_loop,
+                args=(controller,),
+                daemon=True,
+                name=f"write_queue_{controller.key}",
+            )
+            thread.start()
+            log.info("Started write queue for controller %s", controller.name)
+
+    def enqueue_set_target(self, zone: Zone, target: float) -> None:
+        with self.write_queue_cv:
+            self.pending_targets[zone.unique_id] = target
+            self.write_queues.setdefault(zone.controller_key, deque()).append((zone.unique_id, target))
+            self.write_queue_cv.notify_all()
+        log.info("Queued set for %s (%s) to %.1f", zone.zone_name, zone.unique_id, target)
+
+    def write_worker_loop(self, controller: Controller) -> None:
+        while True:
+            with self.write_queue_cv:
+                queue = self.write_queues.setdefault(controller.key, deque())
+                while not queue:
+                    self.write_queue_cv.wait()
+                    queue = self.write_queues.setdefault(controller.key, deque())
+                unique_id, queued_target = queue.popleft()
+                latest_target = self.pending_targets.get(unique_id)
+
+            if latest_target is None:
+                continue
+            if abs(queued_target - latest_target) > 0.001:
+                if DEBUG:
+                    log.debug(
+                        "Skipping stale queued target for %s: queued=%.1f latest=%.1f",
+                        unique_id,
+                        queued_target,
+                        latest_target,
+                    )
+                continue
+
+            zone = self.zones.get(unique_id)
+            if zone is None:
+                log.warning("Dropping queued target for unknown zone %s", unique_id)
+                with self.write_queue_cv:
+                    if abs(self.pending_targets.get(unique_id, latest_target) - latest_target) < 0.001:
+                        self.pending_targets.pop(unique_id, None)
+                continue
+
+            success = self.set_zone_target(zone, latest_target)
+            with self.write_queue_cv:
+                if abs(self.pending_targets.get(unique_id, latest_target) - latest_target) < 0.001:
+                    self.pending_targets.pop(unique_id, None)
+
+            if not success:
+                log.error(
+                    "Giving up queued set for %s (%s) to %.1f after retries",
+                    zone.zone_name,
+                    zone.unique_id,
+                    latest_target,
+                )
+
+    def verify_zone_target(self, controller: Controller, zone_index: int, expected_target: float) -> bool:
+        refreshed_zone = self.refresh_zone_from_regs(controller, zone_index)
+        if refreshed_zone is None or refreshed_zone.target_temp is None:
+            return False
+        return abs(refreshed_zone.target_temp - expected_target) < 0.051
+
+    def set_zone_target(self, zone: Zone, target: float) -> bool:
         controller = self.controllers_by_name.get(zone.controller_name)
         if controller is None:
             log.error("Unknown controller for zone %s", zone.unique_id)
-            return
+            return False
 
-        try:
-            self.run_hmpd(
-                controller,
-                ["set", str(zone.zone_index), f"{target:.1f}"],
-                timeout=self.set_timeout,
-            )
-            zone.target_temp = target
-            self.publish_state(zone)
-            log.info("Set %s (%s) to %.1f", zone.zone_name, zone.unique_id, target)
-        except Exception as exc:
-            log.error(
-                "Failed to set %s (%s) to %.1f: %s",
-                zone.zone_name,
-                zone.unique_id,
-                target,
-                exc,
-            )
+        for attempt in range(1, self.set_max_attempts + 1):
+            try:
+                self.run_hmpd(
+                    controller,
+                    ["set", str(zone.zone_index), f"{target:.1f}"],
+                    timeout=self.set_timeout,
+                )
+                zone.target_temp = target
+                self.publish_state(zone)
+                log.info(
+                    "Set %s (%s) to %.1f on attempt %s",
+                    zone.zone_name,
+                    zone.unique_id,
+                    target,
+                    attempt,
+                )
+                return True
+            except Exception as exc:
+                log.warning(
+                    "Set attempt %s/%s failed for %s (%s) to %.1f: %s",
+                    attempt,
+                    self.set_max_attempts,
+                    zone.zone_name,
+                    zone.unique_id,
+                    target,
+                    exc,
+                )
+
+            time.sleep(self.set_retry_delay_seconds)
+
+            if self.verify_zone_target(controller, zone.zone_index, target):
+                zone.target_temp = target
+                self.publish_state(zone)
+                log.info(
+                    "Confirmed %s (%s) set to %.1f after verification on attempt %s",
+                    zone.zone_name,
+                    zone.unique_id,
+                    target,
+                    attempt,
+                )
+                return True
+
+            if attempt < self.set_max_attempts:
+                log.warning(
+                    "Retrying set for %s (%s) to %.1f (attempt %s)",
+                    zone.zone_name,
+                    zone.unique_id,
+                    target,
+                    attempt + 1,
+                )
+
+        log.error(
+            "Failed to set %s (%s) to %.1f after %s attempts",
+            zone.zone_name,
+            zone.unique_id,
+            target,
+            self.set_max_attempts,
+        )
+        return False
 
     def start(self):
         self.find_hmpd()
