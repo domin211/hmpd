@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import paho.mqtt.client as mqtt
 
@@ -30,8 +30,12 @@ CONTROLLERS = [
     {"name": "usb1", "dev": "/dev/ttyUSB1", "baud": 4800},
 ]
 
+# valid current temp polling
 POLL_INTERVAL = 10
-REG_REFRESH_INTERVAL = 300
+
+# slower regs/name/target refresh
+REG_REFRESH_INTERVAL = 600
+
 TEMPS_TIMEOUT = 15
 REGS_TIMEOUT = 20
 SET_TIMEOUT = 8
@@ -146,6 +150,7 @@ class HMPDBridge:
         }
 
         self.zones: Dict[str, Zone] = {}
+        self.latest_temps: Dict[str, Dict[int, float]] = {}
         self.command_lock = threading.Lock()
         self.last_regs_refresh = 0.0
         self.mqtt_connected = False
@@ -292,7 +297,7 @@ class HMPDBridge:
             return [self.stdbuf_path, "-oL", *base]
         return base
 
-    def run_hmpd(self, controller: Controller, action_args: List[str], timeout: int) -> List[str]:
+    def run_hmpd(self, controller: Controller, action_args: List[str], timeout: int) -> Tuple[List[str], bool]:
         cmd = self.build_hmpd_cmd(controller, action_args)
         if DEBUG:
             log.debug("Running: %s", shlex.join(cmd))
@@ -306,46 +311,50 @@ class HMPDBridge:
             )
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
+                timed_out = False
             except subprocess.TimeoutExpired:
                 proc.kill()
                 stdout, stderr = proc.communicate()
-
-                stdout = (stdout or "").replace("\r", "")
-                stderr = (stderr or "").replace("\r", "")
-
-                if DEBUG and stdout.strip():
-                    log.debug("hmpd partial stdout after timeout:\n%s", stdout.strip())
-                if DEBUG and stderr.strip():
-                    log.debug("hmpd partial stderr after timeout:\n%s", stderr.strip())
-
-                if action_args and action_args[0] == "regs" and stdout.strip():
-                    log.warning(
-                        "hmpd regs timed out for %s, using partial output (%s lines)",
-                        controller.name,
-                        len([line for line in stdout.splitlines() if line.strip()]),
-                    )
-                    return [line.strip() for line in stdout.splitlines() if line.strip()]
-
-                raise RuntimeError(f"Command {cmd!r} timed out after {timeout} seconds")
+                timed_out = True
 
         stdout = (stdout or "").replace("\r", "")
         stderr = (stderr or "").replace("\r", "")
 
         if DEBUG and stdout.strip():
-            log.debug("hmpd stdout:\n%s", stdout.strip())
+            if timed_out:
+                log.debug("hmpd partial stdout after timeout:\n%s", stdout.strip())
+            else:
+                log.debug("hmpd stdout:\n%s", stdout.strip())
+
         if DEBUG and stderr.strip():
-            log.debug("hmpd stderr:\n%s", stderr.strip())
+            if timed_out:
+                log.debug("hmpd partial stderr after timeout:\n%s", stderr.strip())
+            else:
+                log.debug("hmpd stderr:\n%s", stderr.strip())
+
+        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+
+        if timed_out:
+            if action_args and action_args[0] == "regs" and lines:
+                log.warning(
+                    "hmpd regs timed out for %s, using partial output (%s lines)",
+                    controller.name,
+                    len(lines),
+                )
+                return lines, True
+
+            raise RuntimeError(f"Command {cmd!r} timed out after {timeout} seconds")
 
         if proc.returncode != 0:
             raise RuntimeError(f"hmpd exited {proc.returncode}: {stderr.strip() or stdout.strip()}")
 
-        return [line.strip() for line in stdout.splitlines() if line.strip()]
+        return lines, False
 
     def valid_current_temp(self, value: float) -> bool:
         return CURRENT_TEMP_MIN < value < CURRENT_TEMP_MAX
 
-    def parse_regs(self, controller: Controller, lines: List[str]) -> List[Zone]:
-        zones: List[Zone] = []
+    def parse_regs(self, controller: Controller, lines: List[str]) -> Dict[int, dict]:
+        parsed: Dict[int, dict] = {}
 
         for line in lines:
             original = line
@@ -354,7 +363,7 @@ class HMPDBridge:
                 if len(parts) < 5:
                     continue
 
-                idx = int(parts[0])
+                idx = int(parts[0].strip())
                 name = parts[1].strip()
                 if not name:
                     continue
@@ -364,33 +373,23 @@ class HMPDBridge:
 
                 current_temp = None
                 if m_cur:
-                    parsed_current = float(m_cur.group(1))
-                    if self.valid_current_temp(parsed_current):
-                        current_temp = round(parsed_current, 1)
+                    raw_cur = float(m_cur.group(1))
+                    if self.valid_current_temp(raw_cur):
+                        current_temp = round(raw_cur, 1)
 
                 target_temp = None
                 if m_tgt:
-                    target_temp = round(
-                        max(self.temp_min, min(self.temp_max, float(m_tgt.group(1)))),
-                        1,
-                    )
+                    raw_tgt = float(m_tgt.group(1))
+                    target_temp = round(max(self.temp_min, min(self.temp_max, raw_tgt)), 1)
 
                 enabled = "EN" in parts[4]
-                unique = self.zone_unique_id(controller.name, idx)
-                prev = self.zones.get(unique)
 
-                zone = Zone(
-                    controller_name=controller.name,
-                    controller_dev=controller.dev,
-                    zone_index=idx,
-                    zone_name=name,
-                    unique_id=unique,
-                    current_temp=current_temp if current_temp is not None else (prev.current_temp if prev else None),
-                    target_temp=target_temp if target_temp is not None else (prev.target_temp if prev else None),
-                    enabled=enabled,
-                    discovered=prev.discovered if prev else False,
-                )
-                zones.append(zone)
+                parsed[idx] = {
+                    "name": name,
+                    "current_temp": current_temp,
+                    "target_temp": target_temp,
+                    "enabled": enabled,
+                }
 
                 if DEBUG:
                     log.debug(
@@ -398,15 +397,15 @@ class HMPDBridge:
                         controller.name,
                         idx,
                         name,
-                        zone.current_temp,
-                        zone.target_temp,
+                        current_temp,
+                        target_temp,
                         enabled,
                         original,
                     )
             except Exception as exc:
                 log.error("REG parse error [%s]: %s | raw=%s", controller.name, exc, original)
 
-        return zones
+        return parsed
 
     def parse_temps(self, controller: Controller, lines: List[str]) -> Dict[int, float]:
         parsed: Dict[int, float] = {}
@@ -435,24 +434,6 @@ class HMPDBridge:
                 log.error("TEMP parse error [%s]: %s | raw=%s", controller.name, exc, original)
 
         return parsed
-
-    def remove_zone(self, unique_id: str) -> None:
-        discovery_topic = f"{self.discovery_prefix}/climate/hmpd_{unique_id}/config"
-        state_topic = f"{self.base_topic}/{unique_id}/state"
-        self.mqtt.publish(discovery_topic, "", qos=1, retain=True)
-        self.mqtt.publish(state_topic, "", qos=1, retain=True)
-        if unique_id in self.zones:
-            del self.zones[unique_id]
-        log.info("Removed thermostat %s", unique_id)
-
-    def remove_stale_zones_for_controller(self, controller: Controller, valid_ids: set[str]) -> None:
-        to_remove = [
-            unique_id
-            for unique_id, zone in self.zones.items()
-            if zone.controller_name == controller.name and unique_id not in valid_ids
-        ]
-        for unique_id in to_remove:
-            self.remove_zone(unique_id)
 
     def discovery_payload(self, zone: Zone) -> dict:
         state_topic = f"{self.base_topic}/{zone.unique_id}/state"
@@ -486,7 +467,6 @@ class HMPDBridge:
         payload = self.discovery_payload(zone)
         self.mqtt.publish(topic, json.dumps(payload), qos=1, retain=self.retain_discovery)
         zone.discovered = True
-        log.info("Published discovery for %s", zone.zone_name)
 
     def publish_state(self, zone: Zone) -> None:
         topic = f"{self.base_topic}/{zone.unique_id}/state"
@@ -497,41 +477,108 @@ class HMPDBridge:
         }
         self.mqtt.publish(topic, json.dumps(payload), qos=1, retain=self.retain_state)
 
-    def sync_regs(self, controller: Controller) -> None:
-        lines = self.run_hmpd(controller, ["regs"], timeout=self.regs_timeout)
-        zones = self.parse_regs(controller, lines)
-
-        valid_ids: set[str] = set()
-        for zone in zones:
-            valid_ids.add(zone.unique_id)
-            prev = self.zones.get(zone.unique_id)
-            if prev is not None:
-                zone.discovered = prev.discovered
-                if zone.current_temp is None:
-                    zone.current_temp = prev.current_temp
-                if zone.target_temp is None:
-                    zone.target_temp = prev.target_temp
-            self.zones[zone.unique_id] = zone
-            self.publish_discovery(zone)
-            self.publish_state(zone)
-
-        self.remove_stale_zones_for_controller(controller, valid_ids)
-        log.info("Synced %s zones from regs for controller %s", len(zones), controller.name)
+    def remove_zone(self, unique_id: str) -> None:
+        discovery_topic = f"{self.discovery_prefix}/climate/hmpd_{unique_id}/config"
+        state_topic = f"{self.base_topic}/{unique_id}/state"
+        self.mqtt.publish(discovery_topic, "", qos=1, retain=True)
+        self.mqtt.publish(state_topic, "", qos=1, retain=True)
+        if unique_id in self.zones:
+            del self.zones[unique_id]
+        log.info("Removed thermostat %s", unique_id)
 
     def sync_temps(self, controller: Controller) -> None:
-        lines = self.run_hmpd(controller, ["temps"], timeout=self.temps_timeout)
+        lines, _ = self.run_hmpd(controller, ["temps"], timeout=self.temps_timeout)
         temps = self.parse_temps(controller, lines)
+        self.latest_temps[controller.name] = temps
+
+        current_valid_ids = {
+            self.zone_unique_id(controller.name, idx)
+            for idx in temps.keys()
+        }
+
+        to_remove = [
+            unique_id
+            for unique_id, zone in self.zones.items()
+            if zone.controller_name == controller.name and unique_id not in current_valid_ids
+        ]
+        for unique_id in to_remove:
+            self.remove_zone(unique_id)
 
         updated = 0
-        for zone in list(self.zones.values()):
-            if zone.controller_name != controller.name:
-                continue
-            if zone.zone_index in temps:
-                zone.current_temp = temps[zone.zone_index]
+        for idx, current_temp in temps.items():
+            unique_id = self.zone_unique_id(controller.name, idx)
+            zone = self.zones.get(unique_id)
+            if zone:
+                zone.current_temp = current_temp
                 self.publish_state(zone)
                 updated += 1
 
-        log.info("Synced %s temperatures for controller %s", updated, controller.name)
+        total_active = len(
+            [zone for zone in self.zones.values() if zone.controller_name == controller.name]
+        )
+
+        log.info(
+            "Cached %s temperatures for controller %s (%s active zones updated, %s total active)",
+            len(temps),
+            controller.name,
+            updated,
+            total_active,
+        )
+
+    def sync_regs(self, controller: Controller) -> None:
+        lines, is_partial = self.run_hmpd(controller, ["regs"], timeout=self.regs_timeout)
+        parsed = self.parse_regs(controller, lines)
+        temps = self.latest_temps.get(controller.name, {})
+
+        created = 0
+        updated = 0
+
+        for idx, data in parsed.items():
+            name = data["name"].strip() if data["name"] else ""
+            if not name:
+                continue
+
+            if idx not in temps:
+                continue
+
+            current_temp = temps[idx]
+            unique_id = self.zone_unique_id(controller.name, idx)
+            zone = self.zones.get(unique_id)
+
+            if zone is None:
+                zone = Zone(
+                    controller_name=controller.name,
+                    controller_dev=controller.dev,
+                    zone_index=idx,
+                    zone_name=name,
+                    unique_id=unique_id,
+                    current_temp=current_temp,
+                    target_temp=data["target_temp"],
+                    enabled=data["enabled"],
+                    discovered=False,
+                )
+                self.zones[unique_id] = zone
+                created += 1
+            else:
+                zone.zone_name = name
+                zone.current_temp = current_temp
+                if data["target_temp"] is not None:
+                    zone.target_temp = data["target_temp"]
+                zone.enabled = data["enabled"]
+                updated += 1
+
+            if not zone.discovered:
+                self.publish_discovery(zone)
+
+            self.publish_state(zone)
+
+        log.info(
+            "Synced regs for %s (%s created, %s updated)%s",
+            controller.name,
+            created,
+            updated,
+            " (partial)" if is_partial else "",
+        )
 
     def sync_all_regs(self) -> None:
         for controller in self.controllers:
@@ -578,8 +625,13 @@ class HMPDBridge:
             log.info("Configured controller %s -> %s @ %s", controller.name, controller.dev, controller.baud)
 
         self.mqtt_connect_loop()
-        self.sync_all_regs()
+
+        # First temps so we know what has valid current temperature.
         self.sync_all_temps()
+
+        # Then regs, which creates/updates only named zones that also have valid temp.
+        self.sync_all_regs()
+
         self.last_regs_refresh = time.monotonic()
 
         while True:
