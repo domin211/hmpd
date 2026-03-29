@@ -18,8 +18,8 @@ OPTIONS_PATH = "/data/options.json"
 
 MQTT_HOST = os.getenv("MQTT_HOST", "core-mosquitto")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_USERNAME = os.getenv("MQTT_USERNAME", "ufandy")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "Fanda18067")
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 MQTT_DISCOVERY_PREFIX = os.getenv("MQTT_DISCOVERY_PREFIX", "homeassistant")
 MQTT_BASE_TOPIC = os.getenv("MQTT_BASE_TOPIC", "hmpd")
 MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "hmpd_bridge")
@@ -27,8 +27,8 @@ MQTT_KEEPALIVE = 60
 MQTT_RETRY_SECONDS = 10
 
 CONTROLLERS = [
-    {"name": "usb0", "dev": "/dev/ttyUSB0", "baud": 4800},
-    {"name": "usb1", "dev": "/dev/ttyUSB1", "baud": 4800},
+    {"name": "usb0", "dev": "/dev/ttyUSB0", "baud": 4800, "expected_regs": 64},
+    {"name": "usb1", "dev": "/dev/ttyUSB1", "baud": 4800, "expected_regs": 39},
 ]
 
 CURRENT_TEMP_SYNC_INTERVAL = 60
@@ -105,6 +105,7 @@ class Controller:
     name: str
     dev: str
     baud: int
+    expected_regs: int = 64
 
     @property
     def key(self) -> str:
@@ -147,38 +148,53 @@ class ControllerJob:
 
 class HMPDBridge:
     def __init__(self):
-        self.discovery_prefix = MQTT_DISCOVERY_PREFIX
-        self.base_topic = MQTT_BASE_TOPIC
-        self.mqtt_host = MQTT_HOST
-        self.mqtt_port = MQTT_PORT
-        self.mqtt_username = MQTT_USERNAME
-        self.mqtt_password = MQTT_PASSWORD
-        self.mqtt_client_id = MQTT_CLIENT_ID
-        self.mqtt_keepalive = MQTT_KEEPALIVE
-        self.mqtt_retry_seconds = MQTT_RETRY_SECONDS
+        self.discovery_prefix = OPTIONS.get("mqtt_discovery_prefix", MQTT_DISCOVERY_PREFIX)
+        self.base_topic = OPTIONS.get("mqtt_base_topic", MQTT_BASE_TOPIC)
 
-        self.current_temp_sync_interval = CURRENT_TEMP_SYNC_INTERVAL
-        self.target_sync_interval = TARGET_SYNC_INTERVAL
+        self.mqtt_host = OPTIONS.get("mqtt_host", MQTT_HOST)
+        self.mqtt_port = int(OPTIONS.get("mqtt_port", MQTT_PORT))
+        self.mqtt_username = OPTIONS.get("mqtt_username", MQTT_USERNAME)
+        self.mqtt_password = OPTIONS.get("mqtt_password", MQTT_PASSWORD)
 
-        self.temps_timeout = TEMPS_TIMEOUT
-        self.regs_timeout = REGS_TIMEOUT
-        self.set_timeout = SET_TIMEOUT
+        self.mqtt_client_id = OPTIONS.get("mqtt_client_id", MQTT_CLIENT_ID)
+        self.mqtt_keepalive = int(OPTIONS.get("mqtt_keepalive", MQTT_KEEPALIVE))
+        self.mqtt_retry_seconds = int(OPTIONS.get("mqtt_retry_seconds", MQTT_RETRY_SECONDS))
 
-        self.command_gap_seconds = COMMAND_GAP_SECONDS
-        self.max_command_attempts = MAX_COMMAND_ATTEMPTS
-        self.retry_delays_seconds = list(RETRY_DELAYS_SECONDS)
+        self.current_temp_sync_interval = int(
+            OPTIONS.get("current_temp_sync_interval", CURRENT_TEMP_SYNC_INTERVAL)
+        )
+        self.target_sync_interval = int(
+            OPTIONS.get("target_sync_interval", TARGET_SYNC_INTERVAL)
+        )
 
-        self.temp_min = TEMP_MIN
-        self.temp_max = TEMP_MAX
-        self.temp_step = TEMP_STEP
-        self.retain_discovery = RETAIN_DISCOVERY
-        self.retain_state = RETAIN_STATE
-        self.configured_hmpd_path = HMPD_PATH
+        self.temps_timeout = int(OPTIONS.get("temps_timeout", TEMPS_TIMEOUT))
+        self.regs_timeout = int(OPTIONS.get("regs_timeout", REGS_TIMEOUT))
+        self.set_timeout = int(OPTIONS.get("set_timeout", SET_TIMEOUT))
 
+        self.command_gap_seconds = float(OPTIONS.get("command_gap_seconds", COMMAND_GAP_SECONDS))
+        self.max_command_attempts = int(OPTIONS.get("max_command_attempts", MAX_COMMAND_ATTEMPTS))
+        self.retry_delays_seconds = list(
+            OPTIONS.get("retry_delays_seconds", RETRY_DELAYS_SECONDS)
+        )
+
+        self.temp_min = float(OPTIONS.get("temp_min", TEMP_MIN))
+        self.temp_max = float(OPTIONS.get("temp_max", TEMP_MAX))
+        self.temp_step = float(OPTIONS.get("temp_step", TEMP_STEP))
+        self.retain_discovery = bool(OPTIONS.get("retain_discovery", RETAIN_DISCOVERY))
+        self.retain_state = bool(OPTIONS.get("retain_state", RETAIN_STATE))
+        self.configured_hmpd_path = OPTIONS.get("hmpd_path", HMPD_PATH)
+
+        configured_controllers = OPTIONS.get("controllers", CONTROLLERS)
         self.controllers: List[Controller] = [
-            Controller(name=item["name"], dev=item["dev"], baud=int(item["baud"]))
-            for item in CONTROLLERS
+            Controller(
+                name=item["name"],
+                dev=item["dev"],
+                baud=int(item["baud"]),
+                expected_regs=int(item.get("expected_regs", 64)),
+            )
+            for item in configured_controllers
         ]
+
         self.controllers_by_name: Dict[str, Controller] = {
             controller.name: controller for controller in self.controllers
         }
@@ -217,7 +233,10 @@ class HMPDBridge:
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id=self.mqtt_client_id,
         )
-        self.mqtt.username_pw_set(self.mqtt_username, self.mqtt_password)
+
+        if self.mqtt_username:
+            self.mqtt.username_pw_set(self.mqtt_username, self.mqtt_password)
+
         self.mqtt.on_connect = self.on_connect
         self.mqtt.on_disconnect = self.on_disconnect
         self.mqtt.on_message = self.on_message
@@ -764,9 +783,11 @@ class HMPDBridge:
             raise RuntimeError(f"No valid regs returned for controller {controller.name}")
 
         zone_count = len(parsed)
-        if zone_count < MAX_ZONE_INDEX:
+        expected = max(1, int(controller.expected_regs))
+
+        if zone_count < expected:
             raise RuntimeError(
-                f"Incomplete regs output for controller {controller.name}: got {zone_count}, expected at least {MAX_ZONE_INDEX}"
+                f"Incomplete regs output for controller {controller.name}: got {zone_count}, expected at least {expected}"
             )
 
     def run_sync_job(self, controller: Controller, kind: str, reason: str) -> Tuple[List[str], bool]:
@@ -1143,11 +1164,12 @@ class HMPDBridge:
         log.info("=== HMPD Thermostat Bridge starting ===")
         for controller in self.controllers:
             log.info(
-                "Configured controller %s -> %s @ %s (key=%s)",
+                "Configured controller %s -> %s @ %s (key=%s, expected_regs=%s)",
                 controller.name,
                 controller.dev,
                 controller.baud,
                 controller.key,
+                controller.expected_regs,
             )
 
         self.start_controller_workers()
