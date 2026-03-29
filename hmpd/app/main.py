@@ -31,14 +31,16 @@ CONTROLLERS = [
     {"name": "usb1", "dev": "/dev/ttyUSB1", "baud": 4800},
 ]
 
-POLL_INTERVAL = 60
-REG_REFRESH_INTERVAL = 600
-RETRY_AFTER_FAILURE_SECONDS = 5
+CURRENT_TEMP_SYNC_INTERVAL = 60
+TARGET_SYNC_INTERVAL = 3600
+
 TEMPS_TIMEOUT = 15
 REGS_TIMEOUT = 20
 SET_TIMEOUT = 20
-SET_RETRY_ATTEMPTS = 3
-SET_RETRY_DELAY_SECONDS = 5
+
+COMMAND_GAP_SECONDS = 3.0
+MAX_COMMAND_ATTEMPTS = 5
+RETRY_DELAYS_SECONDS = [5, 10, 60, 60]
 
 TEMP_MIN = 16.0
 TEMP_MAX = 32.0
@@ -136,6 +138,7 @@ class ControllerJob:
     timeout: int = 0
     zone_unique_id: Optional[str] = None
     target: Optional[float] = None
+    reason: str = ""
     done: threading.Event = field(default_factory=threading.Event)
     result_lines: List[str] = field(default_factory=list)
     result_partial: bool = False
@@ -154,14 +157,17 @@ class HMPDBridge:
         self.mqtt_keepalive = MQTT_KEEPALIVE
         self.mqtt_retry_seconds = MQTT_RETRY_SECONDS
 
-        self.poll_interval = POLL_INTERVAL
-        self.reg_refresh_interval = REG_REFRESH_INTERVAL
-        self.retry_after_failure_seconds = RETRY_AFTER_FAILURE_SECONDS
+        self.current_temp_sync_interval = CURRENT_TEMP_SYNC_INTERVAL
+        self.target_sync_interval = TARGET_SYNC_INTERVAL
+
         self.temps_timeout = TEMPS_TIMEOUT
         self.regs_timeout = REGS_TIMEOUT
         self.set_timeout = SET_TIMEOUT
-        self.set_retry_attempts = SET_RETRY_ATTEMPTS
-        self.set_retry_delay_seconds = SET_RETRY_DELAY_SECONDS
+
+        self.command_gap_seconds = COMMAND_GAP_SECONDS
+        self.max_command_attempts = MAX_COMMAND_ATTEMPTS
+        self.retry_delays_seconds = list(RETRY_DELAYS_SECONDS)
+
         self.temp_min = TEMP_MIN
         self.temp_max = TEMP_MAX
         self.temp_step = TEMP_STEP
@@ -183,6 +189,7 @@ class HMPDBridge:
         self.zones: Dict[str, Zone] = {}
         self.latest_temps: Dict[str, Dict[int, float]] = {}
         self.latest_regs: Dict[str, Dict[int, dict]] = {}
+
         self.mqtt_connected = False
         self.hmpd_path = ""
         self.stdbuf_path = shutil.which("stdbuf")
@@ -195,11 +202,14 @@ class HMPDBridge:
             controller.key: [] for controller in self.controllers
         }
         self.queue_threads: Dict[str, threading.Thread] = {}
-
-        self.next_temps_poll: Dict[str, float] = {
+        self.last_command_finished_at: Dict[str, float] = {
             controller.key: 0.0 for controller in self.controllers
         }
-        self.next_regs_poll: Dict[str, float] = {
+
+        self.next_temp_sync_at: Dict[str, float] = {
+            controller.key: 0.0 for controller in self.controllers
+        }
+        self.next_target_sync_at: Dict[str, float] = {
             controller.key: 0.0 for controller in self.controllers
         }
 
@@ -306,7 +316,7 @@ class HMPDBridge:
         candidates: Set[str] = set()
         for controller in self.controllers:
             try:
-                lines, _ = self.run_hmpd(controller, ["regs"], timeout=self.regs_timeout)
+                lines, _ = self.run_hmpd_now(controller, ["regs"], timeout=self.regs_timeout)
                 parsed = self.parse_regs(controller, lines)
                 for idx, data in parsed.items():
                     name = (data.get("name") or "").strip()
@@ -534,7 +544,7 @@ class HMPDBridge:
                 log.warning("Invalid target payload for %s: %s", zone_key, payload)
                 return
 
-            self.queue_set_zone_target(zone, self.snap_target(value))
+            self.enqueue_set_zone_target(zone, self.snap_target(value))
         except Exception as exc:
             log.error("MQTT message handling failed for topic %s: %s", topic, exc)
 
@@ -557,22 +567,33 @@ class HMPDBridge:
             )
             self.queue_threads[controller.key] = thread
             thread.start()
-            log.info("Started command queue for controller %s", controller.name)
+            log.info("Started queue worker for controller %s", controller.name)
 
-    def enqueue_controller_job(self, controller: Controller, job: ControllerJob, wait: bool) -> Tuple[List[str], bool]:
+    def pending_set_count(self, controller_key: str) -> int:
+        cond = self.queue_conditions[controller_key]
+        with cond:
+            return sum(1 for job in self.queue_items[controller_key] if job.kind == "set")
+
+    def has_pending_job_kind(self, controller_key: str, kind: str) -> bool:
+        cond = self.queue_conditions[controller_key]
+        with cond:
+            return any(job.kind == kind for job in self.queue_items[controller_key])
+
+    def enqueue_controller_job(self, controller: Controller, job: ControllerJob, wait: bool = False) -> Tuple[List[str], bool]:
         cond = self.queue_conditions[controller.key]
         with cond:
-            if job.kind == "set" and job.zone_unique_id:
-                updated_queue: List[ControllerJob] = []
-                for existing in self.queue_items[controller.key]:
-                    if existing.kind == "set" and existing.zone_unique_id == job.zone_unique_id:
-                        existing.error = RuntimeError("Superseded by newer target request")
-                        existing.done.set()
-                        continue
-                    updated_queue.append(existing)
-                self.queue_items[controller.key] = updated_queue
             self.queue_items[controller.key].append(job)
+            queued_len = len(self.queue_items[controller.key])
             cond.notify()
+
+        if DEBUG:
+            log.debug(
+                "Enqueued %s for %s reason=%s queue_len=%s",
+                job.kind,
+                controller.name,
+                job.reason or "-",
+                queued_len,
+            )
 
         if not wait:
             return [], False
@@ -591,18 +612,99 @@ class HMPDBridge:
                 job = self.queue_items[controller.key].pop(0)
 
             try:
+                self.execute_job_with_retries(controller, job)
+            except Exception as exc:
+                job.error = exc
+                log.error(
+                    "Queue job failed permanently kind=%s controller=%s reason=%s err=%s",
+                    job.kind,
+                    controller.name,
+                    job.reason or "-",
+                    exc,
+                )
+            finally:
+                self.last_command_finished_at[controller.key] = time.monotonic()
+                job.done.set()
+
+    def enforce_command_gap(self, controller: Controller) -> None:
+        last_finished = self.last_command_finished_at.get(controller.key, 0.0)
+        now = time.monotonic()
+        remaining = self.command_gap_seconds - (now - last_finished)
+        if remaining > 0:
+            if DEBUG:
+                log.debug("Waiting %.2fs command gap for %s", remaining, controller.name)
+            time.sleep(remaining)
+
+    def execute_job_with_retries(self, controller: Controller, job: ControllerJob) -> None:
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, self.max_command_attempts + 1):
+            try:
+                self.enforce_command_gap(controller)
+
+                if DEBUG:
+                    log.debug(
+                        "Running queued job attempt=%s/%s kind=%s controller=%s reason=%s",
+                        attempt,
+                        self.max_command_attempts,
+                        job.kind,
+                        controller.name,
+                        job.reason or "-",
+                    )
+
                 if job.kind == "set":
                     self.execute_set_job(controller, job)
                     job.result_lines = []
                     job.result_partial = False
+                    return
+
+                lines, partial = self.run_hmpd_now(controller, job.action_args, job.timeout)
+
+                if job.kind == "temps":
+                    self.validate_temps_result(controller, lines)
+                    self.apply_temps_result(controller, lines)
+                elif job.kind == "regs":
+                    self.validate_regs_result(controller, lines, partial)
+                    self.apply_regs_result(controller, lines, partial)
                 else:
-                    lines, partial = self.run_hmpd_now(controller, job.action_args, job.timeout)
-                    job.result_lines = lines
-                    job.result_partial = partial
+                    raise RuntimeError(f"Unsupported queue job kind: {job.kind}")
+
+                job.result_lines = lines
+                job.result_partial = partial
+                return
+
             except Exception as exc:
-                job.error = exc
-            finally:
-                job.done.set()
+                last_exc = exc
+
+                if attempt >= self.max_command_attempts:
+                    break
+
+                delay = self.retry_delays_seconds[min(attempt - 1, len(self.retry_delays_seconds) - 1)]
+                log.warning(
+                    "Command failed attempt %s/%s for controller=%s kind=%s reason=%s: %s. Retrying in %ss",
+                    attempt,
+                    self.max_command_attempts,
+                    controller.name,
+                    job.kind,
+                    job.reason or "-",
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+
+        log.critical(
+            "BIG WARNING: command failed after %s attempts for controller=%s kind=%s reason=%s action=%s last_error=%s",
+            self.max_command_attempts,
+            controller.name,
+            job.kind,
+            job.reason or "-",
+            job.action_args,
+            last_exc,
+        )
+        raise RuntimeError(
+            f"Command failed after {self.max_command_attempts} attempts for {controller.name} "
+            f"kind={job.kind} reason={job.reason or '-'}: {last_exc}"
+        )
 
     def run_hmpd_now(self, controller: Controller, action_args: List[str], timeout: int) -> Tuple[List[str], bool]:
         cmd = self.build_hmpd_cmd(controller, action_args)
@@ -641,13 +743,6 @@ class HMPDBridge:
         lines = [line.strip() for line in stdout.splitlines() if line.strip()]
 
         if timed_out:
-            if action_args and action_args[0] == "regs" and lines:
-                log.warning(
-                    "hmpd regs timed out for %s, using partial output (%s lines)",
-                    controller.name,
-                    len(lines),
-                )
-                return lines, True
             raise RuntimeError(f"Command {cmd!r} timed out after {timeout} seconds")
 
         if proc.returncode != 0:
@@ -655,24 +750,57 @@ class HMPDBridge:
 
         return lines, False
 
-    def run_hmpd(self, controller: Controller, action_args: List[str], timeout: int) -> Tuple[List[str], bool]:
-        job = ControllerJob(
-            kind=action_args[0] if action_args else "cmd",
-            action_args=list(action_args),
-            timeout=timeout,
-        )
+    def validate_temps_result(self, controller: Controller, lines: List[str]) -> None:
+        temps = self.parse_temps(controller, lines)
+        if not temps:
+            raise RuntimeError(f"No valid temps returned for controller {controller.name}")
+
+    def validate_regs_result(self, controller: Controller, lines: List[str], is_partial: bool) -> None:
+        if is_partial:
+            raise RuntimeError(f"Partial regs output returned for controller {controller.name}")
+
+        parsed = self.parse_regs(controller, lines)
+        if not parsed:
+            raise RuntimeError(f"No valid regs returned for controller {controller.name}")
+
+        zone_count = len(parsed)
+        if zone_count < MAX_ZONE_INDEX:
+            raise RuntimeError(
+                f"Incomplete regs output for controller {controller.name}: got {zone_count}, expected at least {MAX_ZONE_INDEX}"
+            )
+
+    def run_sync_job(self, controller: Controller, kind: str, reason: str) -> Tuple[List[str], bool]:
+        if kind == "temps":
+            job = ControllerJob(
+                kind="temps",
+                action_args=["temps"],
+                timeout=self.temps_timeout,
+                reason=reason,
+            )
+        elif kind == "regs":
+            job = ControllerJob(
+                kind="regs",
+                action_args=["regs"],
+                timeout=self.regs_timeout,
+                reason=reason,
+            )
+        else:
+            raise ValueError(f"Unsupported sync job kind: {kind}")
+
         return self.enqueue_controller_job(controller, job, wait=True)
 
-    def queue_set_zone_target(self, zone: Zone, target: float) -> None:
+    def enqueue_set_zone_target(self, zone: Zone, target: float) -> None:
         controller = self.controllers_by_key.get(zone.controller_key)
         if controller is None:
             log.error("Unknown controller for zone %s", zone.unique_id)
             return
+
         job = ControllerJob(
             kind="set",
             timeout=self.set_timeout,
             zone_unique_id=zone.unique_id,
             target=target,
+            reason="mqtt_set_target",
         )
         self.enqueue_controller_job(controller, job, wait=False)
         log.info("Queued set for %s (%s) to %.1f", zone.zone_name, zone.unique_id, target)
@@ -683,69 +811,23 @@ class HMPDBridge:
             raise RuntimeError(f"Zone not found for queued set: {job.zone_unique_id}")
 
         target = self.snap_target(float(job.target if job.target is not None else self.temp_min))
-        for attempt in range(1, self.set_retry_attempts + 1):
-            try:
-                log.info(
-                    "Processing queued set for %s (%s) to %.1f (attempt %d/%d)",
-                    zone.zone_name,
-                    zone.unique_id,
-                    target,
-                    attempt,
-                    self.set_retry_attempts,
-                )
-                self.run_hmpd_now(
-                    controller,
-                    ["set", str(zone.zone_index), f"{target:.1f}"],
-                    self.set_timeout,
-                )
-                zone.target_temp = target
-                self.publish_state(zone)
-                log.info("Set %s (%s) to %.1f", zone.zone_name, zone.unique_id, target)
-                return
-            except Exception as exc:
-                log.warning(
-                    "Set attempt %d failed for %s (%s) to %.1f: %s",
-                    attempt,
-                    zone.zone_name,
-                    zone.unique_id,
-                    target,
-                    exc,
-                )
 
-                try:
-                    lines, _ = self.run_hmpd_now(controller, ["regs"], self.regs_timeout)
-                    parsed = self.parse_regs(controller, lines)
-                    self.latest_regs[controller.key] = parsed
-                    reg = parsed.get(zone.zone_index)
-                    if reg and reg.get("target_temp") is not None and abs(reg["target_temp"] - target) < 0.05:
-                        if reg.get("current_temp") is not None:
-                            zone.current_temp = reg.get("current_temp")
-                        zone.target_temp = target
-                        zone.enabled = reg.get("enabled")
-                        self.publish_state(zone)
-                        log.info(
-                            "Confirmed %s (%s) set to %.1f after verify on attempt %d",
-                            zone.zone_name,
-                            zone.unique_id,
-                            target,
-                            attempt,
-                        )
-                        return
-                except Exception as verify_exc:
-                    log.warning(
-                        "Verification after failed set for %s (%s) failed: %s",
-                        zone.zone_name,
-                        zone.unique_id,
-                        verify_exc,
-                    )
+        log.info(
+            "Processing set for %s (%s) to %.1f",
+            zone.zone_name,
+            zone.unique_id,
+            target,
+        )
 
-                if attempt < self.set_retry_attempts:
-                    time.sleep(self.set_retry_delay_seconds)
-                    continue
+        self.run_hmpd_now(
+            controller,
+            ["set", str(zone.zone_index), f"{target:.1f}"],
+            self.set_timeout,
+        )
 
-                raise RuntimeError(
-                    f"Failed to set {zone.zone_name} ({zone.unique_id}) to {target:.1f} after {self.set_retry_attempts} attempts"
-                )
+        zone.target_temp = target
+        self.publish_state(zone)
+        log.info("Set %s (%s) to %.1f", zone.zone_name, zone.unique_id, target)
 
     def valid_current_temp(self, value: float) -> bool:
         return CURRENT_TEMP_MIN < value < CURRENT_TEMP_MAX
@@ -890,8 +972,7 @@ class HMPDBridge:
             del self.zones[unique_id]
         log.info("Removed thermostat %s", unique_id)
 
-    def sync_temps(self, controller: Controller) -> None:
-        lines, _ = self.run_hmpd(controller, ["temps"], timeout=self.temps_timeout)
+    def apply_temps_result(self, controller: Controller, lines: List[str]) -> None:
         temps = self.parse_temps(controller, lines)
         self.latest_temps[controller.key] = temps
 
@@ -913,8 +994,7 @@ class HMPDBridge:
             total_active,
         )
 
-    def sync_regs(self, controller: Controller) -> None:
-        lines, is_partial = self.run_hmpd(controller, ["regs"], timeout=self.regs_timeout)
+    def apply_regs_result(self, controller: Controller, lines: List[str], is_partial: bool) -> None:
         parsed = self.parse_regs(controller, lines)
         self.latest_regs[controller.key] = parsed
         temps = self.latest_temps.get(controller.key, {})
@@ -992,27 +1072,71 @@ class HMPDBridge:
             " (partial)" if is_partial else "",
         )
 
-    def sync_all_regs(self) -> None:
-        for controller in self.controllers:
-            self.sync_regs(controller)
+    def sync_temps_blocking(self, controller: Controller, reason: str) -> None:
+        self.run_sync_job(controller, "temps", reason)
 
-    def sync_all_temps(self) -> None:
-        for controller in self.controllers:
-            self.sync_temps(controller)
+    def sync_regs_blocking(self, controller: Controller, reason: str) -> None:
+        self.run_sync_job(controller, "regs", reason)
 
     def force_full_republish(self) -> None:
         self.scan_and_cleanup_discovery_topics()
         self.cleanup_all_retained_topics()
         self.cleanup_legacy_alias_topics()
+
         self.zones = {}
         self.latest_temps = {}
         self.latest_regs = {}
-        self.sync_regs(self.controllers[0])
-        self.sync_regs(self.controllers[1])
-        self.sync_temps(self.controllers[0])
-        self.sync_temps(self.controllers[1])
-        self.sync_regs(self.controllers[0])
-        self.sync_regs(self.controllers[1])
+
+        for controller in self.controllers:
+            self.sync_temps_blocking(controller, "startup_initial_current_temp_sync")
+        for controller in self.controllers:
+            self.sync_regs_blocking(controller, "startup_initial_target_sync")
+
+    def scheduler_loop(self) -> None:
+        while True:
+            self.ensure_mqtt_connected()
+            now = time.monotonic()
+
+            for controller in self.controllers:
+                controller_key = controller.key
+
+                if now >= self.next_temp_sync_at[controller_key]:
+                    if not self.has_pending_job_kind(controller_key, "temps"):
+                        self.enqueue_controller_job(
+                            controller,
+                            ControllerJob(
+                                kind="temps",
+                                action_args=["temps"],
+                                timeout=self.temps_timeout,
+                                reason="scheduled_current_temp_sync",
+                            ),
+                            wait=False,
+                        )
+                        self.next_temp_sync_at[controller_key] = now + self.current_temp_sync_interval
+
+                if now >= self.next_target_sync_at[controller_key]:
+                    pending_sets = self.pending_set_count(controller_key)
+                    if pending_sets > 0:
+                        if DEBUG:
+                            log.debug(
+                                "Delaying target sync for %s because %s set command(s) are still queued",
+                                controller.name,
+                                pending_sets,
+                            )
+                    elif not self.has_pending_job_kind(controller_key, "regs"):
+                        self.enqueue_controller_job(
+                            controller,
+                            ControllerJob(
+                                kind="regs",
+                                action_args=["regs"],
+                                timeout=self.regs_timeout,
+                                reason="scheduled_target_sync",
+                            ),
+                            wait=False,
+                        )
+                        self.next_target_sync_at[controller_key] = now + self.target_sync_interval
+
+            time.sleep(1.0)
 
     def start(self):
         self.find_hmpd()
@@ -1029,43 +1153,15 @@ class HMPDBridge:
         self.start_controller_workers()
         self.mqtt_connect_loop()
         self.publish_bridge_status(True)
+
         self.force_full_republish()
 
         now = time.monotonic()
         for controller in self.controllers:
-            self.next_temps_poll[controller.key] = now + self.poll_interval
-            self.next_regs_poll[controller.key] = now + self.reg_refresh_interval
+            self.next_temp_sync_at[controller.key] = now + self.current_temp_sync_interval
+            self.next_target_sync_at[controller.key] = now + self.target_sync_interval
 
-        while True:
-            self.ensure_mqtt_connected()
-            now = time.monotonic()
-            soonest = now + 1.0
-
-            for controller in self.controllers:
-                if now >= self.next_regs_poll[controller.key]:
-                    try:
-                        self.sync_regs(controller)
-                        self.next_regs_poll[controller.key] = time.monotonic() + self.reg_refresh_interval
-                    except Exception as exc:
-                        log.error("sync_regs failed for %s: %s", controller.name, exc)
-                        self.next_regs_poll[controller.key] = time.monotonic() + self.retry_after_failure_seconds
-
-                if now >= self.next_temps_poll[controller.key]:
-                    try:
-                        self.sync_temps(controller)
-                        self.next_temps_poll[controller.key] = time.monotonic() + self.poll_interval
-                    except Exception as exc:
-                        log.error("sync_temps failed for %s: %s", controller.name, exc)
-                        self.next_temps_poll[controller.key] = time.monotonic() + self.retry_after_failure_seconds
-
-                soonest = min(
-                    soonest,
-                    self.next_regs_poll[controller.key],
-                    self.next_temps_poll[controller.key],
-                )
-
-            sleep_for = max(0.2, min(1.0, soonest - time.monotonic()))
-            time.sleep(sleep_for)
+        self.scheduler_loop()
 
 
 if __name__ == "__main__":
