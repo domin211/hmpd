@@ -173,9 +173,9 @@ class HMPDBridge:
 
         self.command_gap_seconds = float(OPTIONS.get("command_gap_seconds", COMMAND_GAP_SECONDS))
         self.max_command_attempts = int(OPTIONS.get("max_command_attempts", MAX_COMMAND_ATTEMPTS))
-        self.retry_delays_seconds = list(
-            OPTIONS.get("retry_delays_seconds", RETRY_DELAYS_SECONDS)
-        )
+        self.retry_delays_seconds = [
+            int(x) for x in OPTIONS.get("retry_delays_seconds", RETRY_DELAYS_SECONDS)
+        ]
 
         self.temp_min = float(OPTIONS.get("temp_min", TEMP_MIN))
         self.temp_max = float(OPTIONS.get("temp_max", TEMP_MAX))
@@ -220,6 +220,9 @@ class HMPDBridge:
         self.queue_threads: Dict[str, threading.Thread] = {}
         self.last_command_finished_at: Dict[str, float] = {
             controller.key: 0.0 for controller in self.controllers
+        }
+        self.current_job_kind: Dict[str, Optional[str]] = {
+            controller.key: None for controller in self.controllers
         }
 
         self.next_temp_sync_at: Dict[str, float] = {
@@ -598,6 +601,11 @@ class HMPDBridge:
         with cond:
             return any(job.kind == kind for job in self.queue_items[controller_key])
 
+    def is_job_kind_active_or_queued(self, controller_key: str, kind: str) -> bool:
+        if self.current_job_kind.get(controller_key) == kind:
+            return True
+        return self.has_pending_job_kind(controller_key, kind)
+
     def enqueue_controller_job(self, controller: Controller, job: ControllerJob, wait: bool = False) -> Tuple[List[str], bool]:
         cond = self.queue_conditions[controller.key]
         with cond:
@@ -630,6 +638,7 @@ class HMPDBridge:
                     cond.wait()
                 job = self.queue_items[controller.key].pop(0)
 
+            self.current_job_kind[controller.key] = job.kind
             try:
                 self.execute_job_with_retries(controller, job)
             except Exception as exc:
@@ -643,6 +652,7 @@ class HMPDBridge:
                 )
             finally:
                 self.last_command_finished_at[controller.key] = time.monotonic()
+                self.current_job_kind[controller.key] = None
                 job.done.set()
 
     def enforce_command_gap(self, controller: Controller) -> None:
@@ -682,9 +692,11 @@ class HMPDBridge:
                 if job.kind == "temps":
                     self.validate_temps_result(controller, lines)
                     self.apply_temps_result(controller, lines)
+                    self.next_temp_sync_at[controller.key] = time.monotonic() + self.current_temp_sync_interval
                 elif job.kind == "regs":
                     self.validate_regs_result(controller, lines, partial)
                     self.apply_regs_result(controller, lines, partial)
+                    self.next_target_sync_at[controller.key] = time.monotonic() + self.target_sync_interval
                 else:
                     raise RuntimeError(f"Unsupported queue job kind: {job.kind}")
 
@@ -931,6 +943,7 @@ class HMPDBridge:
         state_topic = self.state_topic(zone.unique_id)
         command_topic = self.command_topic(zone.unique_id)
         object_id = f"hmpd_{zone.unique_id}"
+
         return {
             "name": zone.zone_name,
             "object_id": object_id,
@@ -946,6 +959,8 @@ class HMPDBridge:
             "mode_state_topic": state_topic,
             "mode_state_template": "{{ value_json.mode }}",
             "modes": ["heat"],
+            "action_topic": state_topic,
+            "action_template": "{{ value_json.action }}",
             "min_temp": self.temp_min,
             "max_temp": self.temp_max,
             "temp_step": self.temp_step,
@@ -974,16 +989,28 @@ class HMPDBridge:
 
     def publish_state(self, zone: Zone) -> None:
         topic = self.state_topic(zone.unique_id)
+
+        current_temp = zone.current_temp if zone.current_temp is not None else self.temp_min
+        target_temp = zone.target_temp if zone.target_temp is not None else self.temp_min
+
+        if current_temp < target_temp:
+            action = "heating"
+        else:
+            action = "off"
+
         payload = json.dumps(
             {
-                "current_temp": zone.current_temp if zone.current_temp is not None else self.temp_min,
-                "target_temp": zone.target_temp if zone.target_temp is not None else self.temp_min,
+                "current_temp": current_temp,
+                "target_temp": target_temp,
                 "mode": "heat",
+                "action": action,
             },
             sort_keys=True,
         )
+
         if zone.last_state_payload == payload:
             return
+
         self.mqtt.publish(topic, payload, qos=1, retain=self.retain_state)
         zone.last_state_payload = payload
 
@@ -1122,7 +1149,7 @@ class HMPDBridge:
                 controller_key = controller.key
 
                 if now >= self.next_temp_sync_at[controller_key]:
-                    if not self.has_pending_job_kind(controller_key, "temps"):
+                    if not self.is_job_kind_active_or_queued(controller_key, "temps"):
                         self.enqueue_controller_job(
                             controller,
                             ControllerJob(
@@ -1133,18 +1160,18 @@ class HMPDBridge:
                             ),
                             wait=False,
                         )
-                        self.next_temp_sync_at[controller_key] = now + self.current_temp_sync_interval
 
                 if now >= self.next_target_sync_at[controller_key]:
                     pending_sets = self.pending_set_count(controller_key)
-                    if pending_sets > 0:
+                    set_running = self.current_job_kind.get(controller_key) == "set"
+
+                    if pending_sets > 0 or set_running:
                         if DEBUG:
                             log.debug(
-                                "Delaying target sync for %s because %s set command(s) are still queued",
+                                "Delaying target sync for %s because set command(s) are queued or running",
                                 controller.name,
-                                pending_sets,
                             )
-                    elif not self.has_pending_job_kind(controller_key, "regs"):
+                    elif not self.is_job_kind_active_or_queued(controller_key, "regs"):
                         self.enqueue_controller_job(
                             controller,
                             ControllerJob(
@@ -1155,7 +1182,6 @@ class HMPDBridge:
                             ),
                             wait=False,
                         )
-                        self.next_target_sync_at[controller_key] = now + self.target_sync_interval
 
             time.sleep(1.0)
 
