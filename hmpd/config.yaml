@@ -1,6 +1,6 @@
 name: HMPD Thermostat Bridge
 slug: hmpd
-version: "1.4.0"
+version: "1.6.0"
 description: Expose HMPD thermostat zones to Home Assistant as MQTT climate entities
 arch:
   - amd64
@@ -13,6 +13,7 @@ startup: services
 boot: auto
 init: false
 uart: true
+homeassistant_api: true
 
 map:
   - type: homeassistant_config
@@ -35,6 +36,7 @@ options:
 
   current_temp_sync_interval: 60
   target_sync_interval: 3600
+  auto_offset_cooldown_seconds: 60
 
   temps_timeout: 15
   regs_timeout: 20
@@ -53,9 +55,13 @@ options:
   temp_step: 0.5
 
   hmpd_path: /homeassistant/hmpd
+  home_assistant_api_url: http://supervisor/core/api
+  home_assistant_sensor_timeout: 10
 
   retain_discovery: true
   retain_state: true
+
+  external_temp_sensors: []
 
   controllers:
     - name: usb0
@@ -81,6 +87,7 @@ schema:
 
   current_temp_sync_interval: int(10,)
   target_sync_interval: int(60,)
+  auto_offset_cooldown_seconds: int(1,)
 
   temps_timeout: int(1,)
   regs_timeout: int(1,)
@@ -96,9 +103,16 @@ schema:
   temp_step: float
 
   hmpd_path: str
+  home_assistant_api_url: str
+  home_assistant_sensor_timeout: int(1,)
 
   retain_discovery: bool
   retain_state: bool
+
+  external_temp_sensors:
+    - controller: str
+      zone: int(0,)
+      entity_id: match(^[a-z0-9_]+\.[a-z0-9_]+$)
 
   controllers:
     - name: str
