@@ -15,3 +15,40 @@ This repository contains a Home Assistant add-on that exposes HMPD thermostat zo
 
 - Put your `hmpd` binary next to `configuration.yaml` on the Home Assistant host, so the add-on can read it as `/homeassistant/hmpd`.
 - The add-on publishes MQTT discovery `climate` entities.
+
+
+## External temperature sensors
+
+The add-on can now use an existing Home Assistant sensor as the room temperature source for a zone.
+If no external sensor is configured for a zone, it keeps using the built-in HMPD reading.
+
+When an external sensor is configured, the add-on also offsets the controller setpoint in the backend so the physical HMPD regulator still stops heating at the right time even though Home Assistant is showing the external room temperature.
+
+Add entries under `external_temp_sensors` in the add-on options:
+
+```yaml
+external_temp_sensors:
+  - controller: usb0
+    zone: 1
+    entity_id: sensor.living_room_temperature
+  - controller: usb1
+    zone: 3
+    entity_id: sensor.office_temperature
+```
+
+Notes:
+
+- `controller` must match the controller `name` in the add-on config.
+- `zone` is the numeric HMPD zone index.
+- `entity_id` must be an existing Home Assistant sensor entity.
+- When the external sensor is unavailable or invalid, the add-on falls back to the built-in HMPD temperature for that zone.
+- The add-on reads Home Assistant state through the internal Supervisor Core API proxy using `SUPERVISOR_TOKEN`.
+
+
+### Offset control behavior
+
+- Home Assistant shows the external sensor as the current temperature.
+- Home Assistant keeps showing the user-requested target temperature.
+- The add-on calculates an internal controller target from the difference between the built-in HMPD probe and the external HA sensor.
+- That internal controller target is re-synced through the existing queue system with a cooldown of `auto_offset_cooldown_seconds` (default `60`).
+- If the external sensor becomes unavailable, the add-on falls back to the built-in reading and stops applying offset corrections until the external value is usable again.
