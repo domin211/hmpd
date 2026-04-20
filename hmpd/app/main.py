@@ -8,6 +8,9 @@ import subprocess
 import threading
 import time
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -33,6 +36,7 @@ CONTROLLERS = [
 
 CURRENT_TEMP_SYNC_INTERVAL = 60
 TARGET_SYNC_INTERVAL = 3600
+AUTO_OFFSET_COOLDOWN_SECONDS = 60
 
 TEMPS_TIMEOUT = 15
 REGS_TIMEOUT = 20
@@ -50,6 +54,9 @@ CURRENT_TEMP_MIN = 5.0
 CURRENT_TEMP_MAX = 50.0
 
 HMPD_PATH = "/homeassistant/hmpd"
+
+HOME_ASSISTANT_API_URL = "http://supervisor/core/api"
+HOME_ASSISTANT_SENSOR_TIMEOUT = 10
 
 RETAIN_DISCOVERY = True
 RETAIN_STATE = True
@@ -125,11 +132,15 @@ class Zone:
     zone_name: str
     unique_id: str
     current_temp: Optional[float] = None
+    built_in_current_temp: Optional[float] = None
+    controller_target_temp: Optional[float] = None
     target_temp: Optional[float] = None
     enabled: Optional[bool] = None
+    external_sensor_entity_id: Optional[str] = None
     discovered: bool = False
     last_discovery_payload: Optional[str] = None
     last_state_payload: Optional[str] = None
+    last_offset_adjust_at: float = 0.0
 
 
 @dataclass
@@ -166,6 +177,9 @@ class HMPDBridge:
         self.target_sync_interval = int(
             OPTIONS.get("target_sync_interval", TARGET_SYNC_INTERVAL)
         )
+        self.auto_offset_cooldown_seconds = int(
+            OPTIONS.get("auto_offset_cooldown_seconds", AUTO_OFFSET_COOLDOWN_SECONDS)
+        )
 
         self.temps_timeout = int(OPTIONS.get("temps_timeout", TEMPS_TIMEOUT))
         self.regs_timeout = int(OPTIONS.get("regs_timeout", REGS_TIMEOUT))
@@ -183,6 +197,14 @@ class HMPDBridge:
         self.retain_discovery = bool(OPTIONS.get("retain_discovery", RETAIN_DISCOVERY))
         self.retain_state = bool(OPTIONS.get("retain_state", RETAIN_STATE))
         self.configured_hmpd_path = OPTIONS.get("hmpd_path", HMPD_PATH)
+
+        self.ha_api_url = OPTIONS.get("home_assistant_api_url", HOME_ASSISTANT_API_URL).rstrip("/")
+        self.ha_sensor_timeout = int(OPTIONS.get("home_assistant_sensor_timeout", HOME_ASSISTANT_SENSOR_TIMEOUT))
+        self.supervisor_token = os.getenv("SUPERVISOR_TOKEN", "")
+        self.external_temp_sensor_map = self.build_external_temp_sensor_map(
+            OPTIONS.get("external_temp_sensors", [])
+        )
+        self.external_sensor_warnings_shown: Set[Tuple[str, int]] = set()
 
         configured_controllers = OPTIONS.get("controllers", CONTROLLERS)
         self.controllers: List[Controller] = [
@@ -259,6 +281,172 @@ class HMPDBridge:
         steps = round((clamped - self.temp_min) / self.temp_step)
         snapped = self.temp_min + steps * self.temp_step
         return round(max(self.temp_min, min(self.temp_max, snapped)), 1)
+
+    def build_external_temp_sensor_map(self, configured: List[dict]) -> Dict[Tuple[str, int], str]:
+        mapping: Dict[Tuple[str, int], str] = {}
+        for item in configured or []:
+            if not isinstance(item, dict):
+                continue
+
+            controller_name = str(item.get("controller", "")).strip()
+            entity_id = str(item.get("entity_id", "")).strip()
+            zone_raw = item.get("zone")
+
+            if not controller_name or not entity_id or zone_raw in (None, ""):
+                log.warning(
+                    "Ignoring external_temp_sensors entry with missing controller/zone/entity_id: %s",
+                    item,
+                )
+                continue
+
+            try:
+                zone_index = int(zone_raw)
+            except Exception:
+                log.warning("Ignoring external_temp_sensors entry with invalid zone %r: %s", zone_raw, item)
+                continue
+
+            mapping[(controller_name, zone_index)] = entity_id
+
+        return mapping
+
+    def get_external_sensor_entity_id(self, controller_name: str, zone_index: int) -> Optional[str]:
+        entity_id = self.external_temp_sensor_map.get((controller_name, zone_index))
+        if entity_id:
+            return entity_id
+        return None
+
+    def fetch_home_assistant_state(self, entity_id: str) -> Optional[dict]:
+        if not self.supervisor_token:
+            log.warning(
+                "SUPERVISOR_TOKEN is not available, cannot read Home Assistant state for %s", entity_id
+            )
+            return None
+
+        url = f"{self.ha_api_url}/states/{urllib.parse.quote(entity_id, safe='')}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {self.supervisor_token}",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.ha_sensor_timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                log.warning("Failed to fetch Home Assistant state for %s: HTTP %s", entity_id, exc.code)
+            return None
+        except Exception as exc:
+            log.warning("Failed to fetch Home Assistant state for %s: %s", entity_id, exc)
+            return None
+
+    def get_external_current_temp(self, entity_id: str) -> Optional[float]:
+        state = self.fetch_home_assistant_state(entity_id)
+        if not state:
+            return None
+
+        raw_state = state.get("state")
+        if raw_state in (None, "", "unknown", "unavailable"):
+            return None
+
+        try:
+            value = round(float(raw_state), 1)
+        except Exception:
+            log.warning("External sensor %s returned non-numeric state %r", entity_id, raw_state)
+            return None
+
+        if not self.valid_current_temp(value):
+            log.warning("External sensor %s returned out-of-range temperature %s", entity_id, value)
+            return None
+
+        return value
+
+    def apply_external_sensor_temperature(self, zone: Zone) -> bool:
+        entity_id = zone.external_sensor_entity_id or self.get_external_sensor_entity_id(
+            zone.controller_name, zone.zone_index
+        )
+        if not entity_id:
+            return False
+
+        zone.external_sensor_entity_id = entity_id
+        external_temp = self.get_external_current_temp(entity_id)
+        if external_temp is None:
+            key = (zone.controller_name, zone.zone_index)
+            if key not in self.external_sensor_warnings_shown:
+                log.warning(
+                    "External sensor %s for %s zone %s is unavailable or invalid, falling back to built-in reading",
+                    entity_id,
+                    zone.controller_name,
+                    zone.zone_index,
+                )
+                self.external_sensor_warnings_shown.add(key)
+            return False
+
+        key = (zone.controller_name, zone.zone_index)
+        self.external_sensor_warnings_shown.discard(key)
+        zone.current_temp = external_temp
+        return True
+
+    def uses_external_sensor(self, zone: Zone) -> bool:
+        return bool(zone.external_sensor_entity_id or self.get_external_sensor_entity_id(zone.controller_name, zone.zone_index))
+
+    def calculate_offset_adjusted_target(self, zone: Zone, requested_target: float) -> float:
+        if not self.uses_external_sensor(zone):
+            return self.snap_target(requested_target)
+
+        built_in = zone.built_in_current_temp
+        external = zone.current_temp
+        if built_in is None or external is None:
+            return self.snap_target(requested_target)
+
+        offset = built_in - external
+        return self.snap_target(requested_target + offset)
+
+    def infer_display_target_from_controller_target(self, zone: Zone) -> Optional[float]:
+        controller_target = zone.controller_target_temp
+        if controller_target is None:
+            return None
+
+        if not self.uses_external_sensor(zone):
+            return controller_target
+
+        built_in = zone.built_in_current_temp
+        external = zone.current_temp
+        if built_in is None or external is None:
+            return controller_target
+
+        return self.snap_target(controller_target - (built_in - external))
+
+    def maybe_enqueue_offset_adjustment(self, zone: Zone, reason: str) -> None:
+        if not self.uses_external_sensor(zone):
+            return
+        if zone.target_temp is None or zone.controller_target_temp is None:
+            return
+
+        desired_controller_target = self.calculate_offset_adjusted_target(zone, zone.target_temp)
+        if abs(desired_controller_target - zone.controller_target_temp) < (self.temp_step / 2):
+            return
+
+        now = time.monotonic()
+        if (now - zone.last_offset_adjust_at) < self.auto_offset_cooldown_seconds:
+            return
+
+        if self.is_job_kind_active_or_queued(zone.controller_key, "set"):
+            return
+
+        zone.last_offset_adjust_at = now
+        log.info(
+            "Queueing offset adjustment for %s (%s): requested=%.1f controller_current=%.1f controller_desired=%.1f reason=%s",
+            zone.zone_name,
+            zone.unique_id,
+            zone.target_temp,
+            zone.controller_target_temp,
+            desired_controller_target,
+            reason,
+        )
+        self.enqueue_set_zone_target(zone, desired_controller_target, reason=f"offset_{reason}")
 
     def zone_unique_id(self, controller: Controller, zone_index: int) -> str:
         return f"{controller.key}_{int(zone_index)}"
@@ -566,7 +754,11 @@ class HMPDBridge:
                 log.warning("Invalid target payload for %s: %s", zone_key, payload)
                 return
 
-            self.enqueue_set_zone_target(zone, self.snap_target(value))
+            requested_target = self.snap_target(value)
+            zone.target_temp = requested_target
+            controller_target = self.calculate_offset_adjusted_target(zone, requested_target)
+            self.enqueue_set_zone_target(zone, controller_target)
+            self.publish_state(zone)
         except Exception as exc:
             log.error("MQTT message handling failed for topic %s: %s", topic, exc)
 
@@ -822,7 +1014,7 @@ class HMPDBridge:
 
         return self.enqueue_controller_job(controller, job, wait=True)
 
-    def enqueue_set_zone_target(self, zone: Zone, target: float) -> None:
+    def enqueue_set_zone_target(self, zone: Zone, target: float, reason: str = "mqtt_set_target") -> None:
         controller = self.controllers_by_key.get(zone.controller_key)
         if controller is None:
             log.error("Unknown controller for zone %s", zone.unique_id)
@@ -833,7 +1025,7 @@ class HMPDBridge:
             timeout=self.set_timeout,
             zone_unique_id=zone.unique_id,
             target=target,
-            reason="mqtt_set_target",
+            reason=reason,
         )
         self.enqueue_controller_job(controller, job, wait=False)
         log.info("Queued set for %s (%s) to %.1f", zone.zone_name, zone.unique_id, target)
@@ -843,24 +1035,26 @@ class HMPDBridge:
         if zone is None:
             raise RuntimeError(f"Zone not found for queued set: {job.zone_unique_id}")
 
-        target = self.snap_target(float(job.target if job.target is not None else self.temp_min))
+        controller_target = self.snap_target(float(job.target if job.target is not None else self.temp_min))
 
         log.info(
-            "Processing set for %s (%s) to %.1f",
+            "Processing set for %s (%s) to controller target %.1f",
             zone.zone_name,
             zone.unique_id,
-            target,
+            controller_target,
         )
 
         self.run_hmpd_now(
             controller,
-            ["set", str(zone.zone_index), f"{target:.1f}"],
+            ["set", str(zone.zone_index), f"{controller_target:.1f}"],
             self.set_timeout,
         )
 
-        zone.target_temp = target
+        zone.controller_target_temp = controller_target
+        if zone.target_temp is None:
+            zone.target_temp = self.infer_display_target_from_controller_target(zone) or controller_target
         self.publish_state(zone)
-        log.info("Set %s (%s) to %.1f", zone.zone_name, zone.unique_id, target)
+        log.info("Set %s (%s) controller target to %.1f", zone.zone_name, zone.unique_id, controller_target)
 
     def valid_current_temp(self, value: float) -> bool:
         return CURRENT_TEMP_MIN < value < CURRENT_TEMP_MAX
@@ -992,21 +1186,28 @@ class HMPDBridge:
 
         current_temp = zone.current_temp if zone.current_temp is not None else self.temp_min
         target_temp = zone.target_temp if zone.target_temp is not None else self.temp_min
+        controller_target_temp = zone.controller_target_temp if zone.controller_target_temp is not None else target_temp
+        comparison_temp = zone.current_temp if zone.current_temp is not None else current_temp
 
-        if current_temp < target_temp:
+        if comparison_temp < target_temp:
             action = "heating"
         else:
             action = "off"
 
-        payload = json.dumps(
-            {
-                "current_temp": current_temp,
-                "target_temp": target_temp,
-                "mode": "heat",
-                "action": action,
-            },
-            sort_keys=True,
-        )
+        payload_data = {
+            "current_temp": current_temp,
+            "target_temp": target_temp,
+            "mode": "heat",
+            "action": action,
+        }
+
+        if zone.external_sensor_entity_id:
+            payload_data["external_sensor_entity_id"] = zone.external_sensor_entity_id
+            payload_data["controller_target_temp"] = controller_target_temp
+            if zone.built_in_current_temp is not None:
+                payload_data["built_in_current_temp"] = zone.built_in_current_temp
+
+        payload = json.dumps(payload_data, sort_keys=True)
 
         if zone.last_state_payload == payload:
             return
@@ -1029,7 +1230,12 @@ class HMPDBridge:
             unique_id = self.zone_unique_id(controller, idx)
             zone = self.zones.get(unique_id)
             if zone is not None:
+                zone.built_in_current_temp = current_temp
                 zone.current_temp = current_temp
+                self.apply_external_sensor_temperature(zone)
+                if zone.target_temp is None:
+                    zone.target_temp = self.infer_display_target_from_controller_target(zone)
+                self.maybe_enqueue_offset_adjustment(zone, "temp_sync")
                 self.publish_state(zone)
                 updated += 1
 
@@ -1079,19 +1285,30 @@ class HMPDBridge:
                     zone_name=name,
                     unique_id=unique_id,
                     current_temp=current_temp,
+                    built_in_current_temp=current_temp,
+                    controller_target_temp=data["target_temp"],
                     target_temp=data["target_temp"],
                     enabled=data["enabled"],
+                    external_sensor_entity_id=self.get_external_sensor_entity_id(controller.name, idx),
                 )
                 self.zones[unique_id] = zone
                 created += 1
             else:
                 zone.zone_name = name
                 zone.current_temp = current_temp
+                zone.built_in_current_temp = current_temp
                 if data["target_temp"] is not None:
-                    zone.target_temp = data["target_temp"]
+                    zone.controller_target_temp = data["target_temp"]
+                    if zone.target_temp is None or not self.uses_external_sensor(zone):
+                        zone.target_temp = data["target_temp"]
                 zone.enabled = data["enabled"]
                 updated += 1
 
+            self.apply_external_sensor_temperature(zone)
+            inferred_target = self.infer_display_target_from_controller_target(zone)
+            if inferred_target is not None and zone.target_temp is None:
+                zone.target_temp = inferred_target
+            self.maybe_enqueue_offset_adjustment(zone, "regs_sync")
             self.publish_discovery(zone)
             self.publish_state(zone)
 
