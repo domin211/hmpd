@@ -14,10 +14,12 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 COPY app/ /app/
+COPY hmpd /app/hmpd
 
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir -r /app/requirements.txt \
-    && chmod +x /app/run.sh
+    && chmod +x /app/run.sh \
+    && if [ -f /app/hmpd ]; then chmod +x /app/hmpd; fi
 
 ENV PATH="/opt/venv/bin:${PATH}"
 

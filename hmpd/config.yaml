@@ -30,7 +30,7 @@ options:
   mqtt_password: ""
   mqtt_discovery_prefix: homeassistant
   mqtt_base_topic: hmpd
-  hmpd_path: /homeassistant/hmpd
+  hmpd_path: /app/hmpd
 
   current_temp_sync_interval: 60
   target_sync_interval: 3600
