@@ -14,6 +14,7 @@ This repository contains a Home Assistant add-on that exposes HMPD thermostat zo
 ## Notes
 
 - Put your `hmpd` binary next to `configuration.yaml` on the Home Assistant host, so the add-on can read it as `/homeassistant/hmpd`.
+- If your binary is in a different location, set `hmpd_path` in add-on options.
 - The add-on publishes MQTT discovery `climate` entities.
 
 

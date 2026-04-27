@@ -60,7 +60,8 @@ BOOKING_STATE_PATH = "/data/booking_state.json"
 CURRENT_TEMP_MIN = 5.0
 CURRENT_TEMP_MAX = 50.0
 
-HMPD_PATH = "/homeassistant/hmpd"
+HMPD_PATH = os.getenv("HMPD_PATH", "/homeassistant/hmpd")
+HMPD_FIND_RETRY_SECONDS = 30
 
 HOME_ASSISTANT_API_URL = "http://supervisor/core/api"
 HOME_ASSISTANT_SENSOR_TIMEOUT = 10
@@ -887,9 +888,18 @@ class HMPDBridge:
         candidates = [
             self.configured_hmpd_path,
             "/homeassistant/hmpd",
+            "/homeassistant/hmpd/hmpd",
+            "/homeassistant/config/hmpd",
+            "/homeassistant/config/hmpd/hmpd",
             "/config/hmpd",
+            "/config/hmpd/hmpd",
+            "/config/bin/hmpd",
             "/ha_config/hmpd",
+            "/ha_config/hmpd/hmpd",
+            "/share/hmpd",
+            "/share/hmpd/hmpd",
             "/app/hmpd",
+            "/app/hmpd/hmpd",
             "./hmpd",
         ]
         seen = set()
@@ -902,20 +912,37 @@ class HMPDBridge:
 
     def find_hmpd(self) -> str:
         checked = []
-        for path in self.hmpd_candidates():
-            checked.append(path)
-            if os.path.isfile(path):
-                if not os.access(path, os.X_OK):
-                    try:
-                        os.chmod(path, 0o755)
-                    except Exception:
-                        pass
-                if os.access(path, os.X_OK):
-                    if self.hmpd_path != path:
-                        log.info("Using hmpd binary: %s", path)
-                    self.hmpd_path = path
-                    return path
+        for candidate in self.hmpd_candidates():
+            candidate_paths = [candidate]
+            if os.path.isdir(candidate):
+                candidate_paths.append(os.path.join(candidate, "hmpd"))
+
+            for path in candidate_paths:
+                checked.append(path)
+                if os.path.isfile(path):
+                    if not os.access(path, os.X_OK):
+                        try:
+                            os.chmod(path, 0o755)
+                        except Exception:
+                            pass
+                    if os.access(path, os.X_OK):
+                        if self.hmpd_path != path:
+                            log.info("Using hmpd binary: %s", path)
+                        self.hmpd_path = path
+                        return path
         raise FileNotFoundError("Could not find executable hmpd. Checked: " + ", ".join(checked))
+
+    def wait_for_hmpd(self) -> str:
+        while True:
+            try:
+                return self.find_hmpd()
+            except FileNotFoundError as exc:
+                log.error(
+                    "%s. Set hmpd_path in add-on options or place the binary in one of the checked paths. Retrying in %ss",
+                    exc,
+                    HMPD_FIND_RETRY_SECONDS,
+                )
+                time.sleep(HMPD_FIND_RETRY_SECONDS)
 
     def ensure_hmpd(self) -> str:
         if self.hmpd_path and os.path.isfile(self.hmpd_path) and os.access(self.hmpd_path, os.X_OK):
@@ -1889,7 +1916,7 @@ class HMPDBridge:
             time.sleep(1.0)
 
     def start(self):
-        self.find_hmpd()
+        self.wait_for_hmpd()
         log.info("=== HMPD Thermostat Bridge starting ===")
         for controller in self.controllers:
             log.info(

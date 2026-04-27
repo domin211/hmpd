@@ -1,6 +1,6 @@
 name: HMPD Thermostat Bridge
 slug: hmpd
-version: "2.2.0"
+version: "2.3.0"
 description: Expose HMPD thermostat zones to Home Assistant as MQTT climate entities
 arch:
   - amd64
@@ -30,6 +30,7 @@ options:
   mqtt_password: ""
   mqtt_discovery_prefix: homeassistant
   mqtt_base_topic: hmpd
+  hmpd_path: /homeassistant/hmpd
 
   current_temp_sync_interval: 60
   target_sync_interval: 3600
@@ -65,6 +66,7 @@ schema:
   mqtt_password: password?
   mqtt_discovery_prefix: str
   mqtt_base_topic: str
+  hmpd_path: str
 
   current_temp_sync_interval: int(10,)
   target_sync_interval: int(60,)
