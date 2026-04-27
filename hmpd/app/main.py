@@ -37,6 +37,7 @@ CONTROLLERS = [
 CURRENT_TEMP_SYNC_INTERVAL = 60
 TARGET_SYNC_INTERVAL = 3600
 AUTO_OFFSET_COOLDOWN_SECONDS = 60
+EXTERNAL_SENSOR_TARGET_OFFSET = 2.0
 
 TEMPS_TIMEOUT = 15
 REGS_TIMEOUT = 20
@@ -198,6 +199,9 @@ class HMPDBridge:
         )
         self.auto_offset_cooldown_seconds = int(
             OPTIONS.get("auto_offset_cooldown_seconds", AUTO_OFFSET_COOLDOWN_SECONDS)
+        )
+        self.external_sensor_target_offset = float(
+            OPTIONS.get("external_sensor_target_offset", EXTERNAL_SENSOR_TARGET_OFFSET)
         )
 
         self.temps_timeout = int(OPTIONS.get("temps_timeout", TEMPS_TIMEOUT))
@@ -486,10 +490,10 @@ class HMPDBridge:
                     if booking_state is not None and zone.booking_state != booking_state:
                         zone.booking_state = booking_state
                         self.persist_booking_zone_state()
+                self.maybe_apply_booking_target(zone, "calendar_sync")
 
             self.publish_booking_state(zone)
             self.publish_booking_temperatures(zone)
-            self.maybe_apply_booking_target(zone, "calendar_sync")
 
     def fetch_home_assistant_state(self, entity_id: str) -> Optional[dict]:
         if not self.supervisor_token:
@@ -568,6 +572,13 @@ class HMPDBridge:
     def uses_external_sensor(self, zone: Zone) -> bool:
         return bool(zone.external_sensor_entity_id or self.get_external_sensor_entity_id(zone.controller_name, zone.zone_index))
 
+    def external_sensor_directional_offset(self, requested_target: float, external_current: Optional[float]) -> float:
+        if external_current is None:
+            return 0.0
+        if external_current < requested_target:
+            return self.external_sensor_target_offset
+        return -self.external_sensor_target_offset
+
     def calculate_offset_adjusted_target(self, zone: Zone, requested_target: float) -> float:
         if requested_target <= OFF_MODE_TARGET_THRESHOLD:
             return self.snap_target(requested_target)
@@ -580,13 +591,18 @@ class HMPDBridge:
         if built_in is None or external is None:
             return self.snap_target(requested_target)
 
-        offset = built_in - external
+        offset = built_in - external + self.external_sensor_directional_offset(
+            requested_target,
+            external,
+        )
         return self.snap_target(requested_target + offset)
 
     def infer_display_target_from_controller_target(self, zone: Zone) -> Optional[float]:
         controller_target = zone.controller_target_temp
         if controller_target is None:
             return None
+        if controller_target <= OFF_MODE_TARGET_THRESHOLD:
+            return controller_target
 
         if not self.uses_external_sensor(zone):
             return controller_target
@@ -596,7 +612,20 @@ class HMPDBridge:
         if built_in is None or external is None:
             return controller_target
 
-        return self.snap_target(controller_target - (built_in - external))
+        base_offset = built_in - external
+        candidate_plus = self.snap_target(
+            controller_target - base_offset - self.external_sensor_target_offset
+        )
+        candidate_minus = self.snap_target(
+            controller_target - base_offset + self.external_sensor_target_offset
+        )
+
+        plus_controller_target = self.calculate_offset_adjusted_target(zone, candidate_plus)
+        minus_controller_target = self.calculate_offset_adjusted_target(zone, candidate_minus)
+
+        if abs(plus_controller_target - controller_target) <= abs(minus_controller_target - controller_target):
+            return candidate_plus
+        return candidate_minus
 
     def maybe_enqueue_offset_adjustment(self, zone: Zone, reason: str) -> None:
         if not self.uses_external_sensor(zone):
@@ -1429,8 +1458,6 @@ class HMPDBridge:
             "mode_state_topic": state_topic,
             "mode_state_template": "{{ value_json.mode }}",
             "modes": ["off", "heat"],
-            "action_topic": state_topic,
-            "action_template": "{{ value_json.action }}",
             "min_temp": self.temp_min,
             "max_temp": self.temp_max,
             "temp_step": self.temp_step,
@@ -1598,23 +1625,16 @@ class HMPDBridge:
         current_temp = zone.current_temp if zone.current_temp is not None else self.temp_min
         target_temp = zone.target_temp if zone.target_temp is not None else self.temp_min
         controller_target_temp = zone.controller_target_temp if zone.controller_target_temp is not None else target_temp
-        comparison_temp = zone.current_temp if zone.current_temp is not None else current_temp
 
         if self.is_zone_off_mode(zone):
             mode = "off"
-            action = "off"
-        elif comparison_temp < target_temp:
-            mode = "heat"
-            action = "heating"
         else:
             mode = "heat"
-            action = "off"
 
         payload_data = {
             "current_temp": current_temp,
             "target_temp": target_temp,
             "mode": mode,
-            "action": action,
             "booking_state": "on" if zone.booking_state else "off",
             "booking_on_temp": zone.booking_on_temp,
             "booking_off_temp": zone.booking_off_temp,
@@ -1762,7 +1782,8 @@ class HMPDBridge:
             if inferred_target is not None and zone.target_temp is None:
                 zone.target_temp = inferred_target
 
-            self.maybe_apply_booking_target(zone, "regs_sync")
+            if zone.booking_entity_id:
+                self.maybe_apply_booking_target(zone, "regs_sync")
             self.maybe_enqueue_offset_adjustment(zone, "regs_sync")
             self.publish_discovery(zone)
             self.publish_booking_state(zone)

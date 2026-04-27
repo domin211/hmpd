@@ -27,6 +27,8 @@ When an external sensor is configured, the add-on also offsets the controller se
 Add entries under `external_temp_sensors` in the add-on options:
 
 ```yaml
+external_sensor_target_offset: 2.0
+
 external_temp_sensors:
   - controller: usb0
     zone: 1
@@ -49,7 +51,8 @@ Notes:
 
 - Home Assistant shows the external sensor as the current temperature.
 - Home Assistant keeps showing the user-requested target temperature.
-- The add-on calculates an internal controller target from the difference between the built-in HMPD probe and the external HA sensor.
+- `external_sensor_target_offset` is configurable in add-on options (default `2.0`).
+- The add-on calculates an internal controller target from the difference between the built-in HMPD probe and the external HA sensor, then applies the configured offset directionally: `+offset` when room temperature is below target and `-offset` when room temperature is already at/above target.
 - That internal controller target is re-synced through the existing queue system with a cooldown of `auto_offset_cooldown_seconds` (default `60`).
 - If the external sensor becomes unavailable, the add-on falls back to the built-in reading and stops applying offset corrections until the external value is usable again.
 
