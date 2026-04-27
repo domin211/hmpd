@@ -54,6 +54,10 @@ options:
   temp_max: 32.0
   temp_step: 0.5
 
+  booking_sync_interval: 60
+  booking_on_temp_default: 23.0
+  booking_off_temp_default: 16.0
+
   hmpd_path: /homeassistant/hmpd
   home_assistant_api_url: http://supervisor/core/api
   home_assistant_sensor_timeout: 10
@@ -61,6 +65,7 @@ options:
   retain_discovery: true
   retain_state: true
 
+  booking_status_entities: []
   external_temp_sensors: []
 
   controllers:
@@ -102,12 +107,21 @@ schema:
   temp_max: float
   temp_step: float
 
+  booking_sync_interval: int(10,)
+  booking_on_temp_default: float
+  booking_off_temp_default: float
+
   hmpd_path: str
   home_assistant_api_url: str
   home_assistant_sensor_timeout: int(1,)
 
   retain_discovery: bool
   retain_state: bool
+
+  booking_status_entities:
+    - controller: str
+      zone: int(0,)
+      entity_id: match(^[a-z0-9_]+\.[a-z0-9_]+$)
 
   external_temp_sensors:
     - controller: str

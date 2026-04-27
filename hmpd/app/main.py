@@ -49,6 +49,12 @@ RETRY_DELAYS_SECONDS = [5, 10, 60, 60]
 TEMP_MIN = 16.0
 TEMP_MAX = 32.0
 TEMP_STEP = 0.5
+OFF_MODE_TARGET_THRESHOLD = 18.0
+
+BOOKING_SYNC_INTERVAL = 60
+BOOKING_ON_TEMP_DEFAULT = 23.0
+BOOKING_OFF_TEMP_DEFAULT = 16.0
+BOOKING_STATE_PATH = "/data/booking_state.json"
 
 CURRENT_TEMP_MIN = 5.0
 CURRENT_TEMP_MAX = 50.0
@@ -137,9 +143,22 @@ class Zone:
     target_temp: Optional[float] = None
     enabled: Optional[bool] = None
     external_sensor_entity_id: Optional[str] = None
+    booking_entity_id: Optional[str] = None
+    booking_state: Optional[bool] = None
+    booking_on_temp: float = BOOKING_ON_TEMP_DEFAULT
+    booking_off_temp: float = BOOKING_OFF_TEMP_DEFAULT
     discovered: bool = False
+    booking_discovered: bool = False
+    booking_on_temp_discovered: bool = False
+    booking_off_temp_discovered: bool = False
     last_discovery_payload: Optional[str] = None
+    last_booking_discovery_payload: Optional[str] = None
+    last_booking_on_temp_discovery_payload: Optional[str] = None
+    last_booking_off_temp_discovery_payload: Optional[str] = None
     last_state_payload: Optional[str] = None
+    last_booking_state_payload: Optional[str] = None
+    last_booking_on_temp_payload: Optional[str] = None
+    last_booking_off_temp_payload: Optional[str] = None
     last_offset_adjust_at: float = 0.0
 
 
@@ -194,6 +213,15 @@ class HMPDBridge:
         self.temp_min = float(OPTIONS.get("temp_min", TEMP_MIN))
         self.temp_max = float(OPTIONS.get("temp_max", TEMP_MAX))
         self.temp_step = float(OPTIONS.get("temp_step", TEMP_STEP))
+        self.booking_sync_interval = int(
+            OPTIONS.get("booking_sync_interval", BOOKING_SYNC_INTERVAL)
+        )
+        self.booking_on_temp_default = self.snap_target(
+            float(OPTIONS.get("booking_on_temp_default", BOOKING_ON_TEMP_DEFAULT))
+        )
+        self.booking_off_temp_default = self.snap_target(
+            float(OPTIONS.get("booking_off_temp_default", BOOKING_OFF_TEMP_DEFAULT))
+        )
         self.retain_discovery = bool(OPTIONS.get("retain_discovery", RETAIN_DISCOVERY))
         self.retain_state = bool(OPTIONS.get("retain_state", RETAIN_STATE))
         self.configured_hmpd_path = OPTIONS.get("hmpd_path", HMPD_PATH)
@@ -204,6 +232,10 @@ class HMPDBridge:
         self.external_temp_sensor_map = self.build_external_temp_sensor_map(
             OPTIONS.get("external_temp_sensors", [])
         )
+        self.booking_entity_map = self.build_booking_entity_map(
+            OPTIONS.get("booking_status_entities", [])
+        )
+        self.saved_booking_zone_state = self.load_saved_booking_zone_state()
         self.external_sensor_warnings_shown: Set[Tuple[str, int]] = set()
 
         configured_controllers = OPTIONS.get("controllers", CONTROLLERS)
@@ -253,6 +285,7 @@ class HMPDBridge:
         self.next_target_sync_at: Dict[str, float] = {
             controller.key: 0.0 for controller in self.controllers
         }
+        self.next_booking_sync_at = 0.0
 
         self.mqtt = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -314,6 +347,149 @@ class HMPDBridge:
         if entity_id:
             return entity_id
         return None
+
+    def build_booking_entity_map(self, configured: List[dict]) -> Dict[Tuple[str, int], str]:
+        mapping: Dict[Tuple[str, int], str] = {}
+        for item in configured or []:
+            if not isinstance(item, dict):
+                continue
+
+            controller_name = str(item.get("controller", "")).strip()
+            entity_id = str(item.get("entity_id", "")).strip()
+            zone_raw = item.get("zone")
+
+            if not controller_name or not entity_id or zone_raw in (None, ""):
+                log.warning(
+                    "Ignoring booking_status_entities entry with missing controller/zone/entity_id: %s",
+                    item,
+                )
+                continue
+
+            try:
+                zone_index = int(zone_raw)
+            except Exception:
+                log.warning("Ignoring booking_status_entities entry with invalid zone %r: %s", zone_raw, item)
+                continue
+
+            mapping[(controller_name, zone_index)] = entity_id
+
+        return mapping
+
+    def get_booking_entity_id(self, controller_name: str, zone_index: int) -> Optional[str]:
+        entity_id = self.booking_entity_map.get((controller_name, zone_index))
+        if entity_id:
+            return entity_id
+        return None
+
+    def load_saved_booking_zone_state(self) -> Dict[str, dict]:
+        try:
+            with open(BOOKING_STATE_PATH, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            zones = payload.get("zones", {})
+            if isinstance(zones, dict):
+                return zones
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            log.warning("Could not read booking state file %s: %s", BOOKING_STATE_PATH, exc)
+        return {}
+
+    def persist_booking_zone_state(self) -> None:
+        payload = {
+            "zones": {
+                unique_id: {
+                    "on_temp": zone.booking_on_temp,
+                    "off_temp": zone.booking_off_temp,
+                    "booking_state": zone.booking_state,
+                }
+                for unique_id, zone in self.zones.items()
+            }
+        }
+
+        try:
+            os.makedirs(os.path.dirname(BOOKING_STATE_PATH), exist_ok=True)
+            temp_path = f"{BOOKING_STATE_PATH}.tmp"
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+            os.replace(temp_path, BOOKING_STATE_PATH)
+            self.saved_booking_zone_state = payload["zones"]
+        except Exception as exc:
+            log.warning("Could not persist booking state file %s: %s", BOOKING_STATE_PATH, exc)
+
+    def get_saved_booking_values(self, unique_id: str) -> Tuple[float, float, bool]:
+        on_temp = self.booking_on_temp_default
+        off_temp = self.booking_off_temp_default
+        booking_state = False
+
+        raw_values = self.saved_booking_zone_state.get(unique_id)
+        if isinstance(raw_values, dict):
+            raw_on = raw_values.get("on_temp")
+            raw_off = raw_values.get("off_temp")
+            raw_state = raw_values.get("booking_state")
+
+            try:
+                if raw_on is not None:
+                    on_temp = self.snap_target(float(raw_on))
+            except Exception:
+                pass
+
+            try:
+                if raw_off is not None:
+                    off_temp = self.snap_target(float(raw_off))
+            except Exception:
+                pass
+
+            if isinstance(raw_state, bool):
+                booking_state = raw_state
+            elif isinstance(raw_state, str):
+                parsed_state = self.parse_booking_state(raw_state)
+                if parsed_state is not None:
+                    booking_state = parsed_state
+
+        return on_temp, off_temp, booking_state
+
+    def parse_booking_state(self, raw_state: str) -> Optional[bool]:
+        normalized = str(raw_state).strip().lower()
+        if normalized in {"on", "true", "1", "yes", "booked", "occupied", "active"}:
+            return True
+        if normalized in {"off", "false", "0", "no", "unbooked", "vacant", "inactive", "idle"}:
+            return False
+        return None
+
+    def booking_target_for_zone(self, zone: Zone) -> float:
+        if zone.booking_state:
+            return self.snap_target(zone.booking_on_temp)
+        return self.snap_target(zone.booking_off_temp)
+
+    def maybe_apply_booking_target(self, zone: Zone, reason: str) -> None:
+        desired_display_target = self.booking_target_for_zone(zone)
+        if zone.target_temp is not None and abs(zone.target_temp - desired_display_target) < (self.temp_step / 2):
+            return
+
+        controller_target = self.calculate_offset_adjusted_target(zone, desired_display_target)
+
+        if self.is_job_kind_active_or_queued(zone.controller_key, "set"):
+            zone.target_temp = desired_display_target
+            self.publish_state(zone)
+            return
+
+        zone.target_temp = desired_display_target
+        self.enqueue_set_zone_target(zone, controller_target, reason=f"booking_{reason}")
+        self.publish_state(zone)
+
+    def sync_booking_states_from_home_assistant(self) -> None:
+        for zone in self.zones.values():
+            if zone.booking_entity_id:
+                state = self.fetch_home_assistant_state(zone.booking_entity_id)
+                if state:
+                    booking_state = self.parse_booking_state(state.get("state", ""))
+                    if booking_state is not None and zone.booking_state != booking_state:
+                        zone.booking_state = booking_state
+                        self.persist_booking_zone_state()
+
+            self.publish_booking_state(zone)
+            self.publish_booking_temperatures(zone)
+            self.maybe_apply_booking_target(zone, "calendar_sync")
 
     def fetch_home_assistant_state(self, entity_id: str) -> Optional[dict]:
         if not self.supervisor_token:
@@ -393,6 +569,9 @@ class HMPDBridge:
         return bool(zone.external_sensor_entity_id or self.get_external_sensor_entity_id(zone.controller_name, zone.zone_index))
 
     def calculate_offset_adjusted_target(self, zone: Zone, requested_target: float) -> float:
+        if requested_target <= OFF_MODE_TARGET_THRESHOLD:
+            return self.snap_target(requested_target)
+
         if not self.uses_external_sensor(zone):
             return self.snap_target(requested_target)
 
@@ -421,6 +600,8 @@ class HMPDBridge:
 
     def maybe_enqueue_offset_adjustment(self, zone: Zone, reason: str) -> None:
         if not self.uses_external_sensor(zone):
+            return
+        if self.is_zone_off_mode(zone):
             return
         if zone.target_temp is None or zone.controller_target_temp is None:
             return
@@ -457,13 +638,53 @@ class HMPDBridge:
     def command_topic(self, unique_id: str) -> str:
         return f"{self.base_topic}/{unique_id}/set_target"
 
+    def booking_state_topic(self, unique_id: str) -> str:
+        return f"{self.base_topic}/{unique_id}/booking/state"
+
+    def booking_state_command_topic(self, unique_id: str) -> str:
+        return f"{self.base_topic}/{unique_id}/booking/state/set"
+
+    def booking_on_temp_state_topic(self, unique_id: str) -> str:
+        return f"{self.base_topic}/{unique_id}/booking/on_temp/state"
+
+    def booking_on_temp_command_topic(self, unique_id: str) -> str:
+        return f"{self.base_topic}/{unique_id}/booking/on_temp/set"
+
+    def booking_off_temp_state_topic(self, unique_id: str) -> str:
+        return f"{self.base_topic}/{unique_id}/booking/off_temp/state"
+
+    def booking_off_temp_command_topic(self, unique_id: str) -> str:
+        return f"{self.base_topic}/{unique_id}/booking/off_temp/set"
+
     def discovery_topic(self, unique_id: str) -> str:
         return f"{self.discovery_prefix}/climate/hmpd_{unique_id}/config"
 
+    def booking_discovery_topic(self, unique_id: str) -> str:
+        return f"{self.discovery_prefix}/switch/hmpd_{unique_id}_booking/config"
+
+    def booking_on_temp_discovery_topic(self, unique_id: str) -> str:
+        return f"{self.discovery_prefix}/number/hmpd_{unique_id}_booking_on_temp/config"
+
+    def booking_off_temp_discovery_topic(self, unique_id: str) -> str:
+        return f"{self.discovery_prefix}/number/hmpd_{unique_id}_booking_off_temp/config"
+
     def cleanup_unique_id(self, unique_id: str) -> None:
-        self.mqtt.publish(self.discovery_topic(unique_id), "", qos=1, retain=True)
-        self.mqtt.publish(self.state_topic(unique_id), "", qos=1, retain=True)
-        self.mqtt.publish(self.command_topic(unique_id), "", qos=1, retain=True)
+        topics = [
+            self.discovery_topic(unique_id),
+            self.booking_discovery_topic(unique_id),
+            self.booking_on_temp_discovery_topic(unique_id),
+            self.booking_off_temp_discovery_topic(unique_id),
+            self.state_topic(unique_id),
+            self.command_topic(unique_id),
+            self.booking_state_topic(unique_id),
+            self.booking_state_command_topic(unique_id),
+            self.booking_on_temp_state_topic(unique_id),
+            self.booking_on_temp_command_topic(unique_id),
+            self.booking_off_temp_state_topic(unique_id),
+            self.booking_off_temp_command_topic(unique_id),
+        ]
+        for topic in topics:
+            self.mqtt.publish(topic, "", qos=1, retain=True)
 
     def zone_alias_candidates(self, controller: Controller, idx: int, name: str) -> Set[str]:
         base_name = name.strip()
@@ -711,6 +932,7 @@ class HMPDBridge:
             self.mqtt_connected = True
             log.info("Connected to MQTT broker %s:%s", self.mqtt_host, self.mqtt_port)
             client.subscribe(f"{self.base_topic}/+/set_target")
+            client.subscribe(f"{self.base_topic}/+/booking/+/set")
             client.subscribe(f"{self.base_topic}/bridge/resync")
         else:
             self.mqtt_connected = False
@@ -732,35 +954,89 @@ class HMPDBridge:
                 self.force_full_republish()
                 return
 
-            m = re.match(rf"^{re.escape(self.base_topic)}/([^/]+)/set_target$", topic)
-            if not m:
+            target_match = re.match(rf"^{re.escape(self.base_topic)}/([^/]+)/set_target$", topic)
+            if target_match:
+                self.handle_set_target_command(target_match.group(1), payload)
                 return
 
-            zone_key = m.group(1)
-            if not payload:
-                if DEBUG and not self.suppress_empty_command_logs:
-                    log.debug("Ignoring empty target payload for %s", zone_key)
+            booking_match = re.match(
+                rf"^{re.escape(self.base_topic)}/([^/]+)/booking/(state|on_temp|off_temp)/set$",
+                topic,
+            )
+            if booking_match:
+                self.handle_booking_command(
+                    booking_match.group(1),
+                    booking_match.group(2),
+                    payload,
+                )
                 return
-
-            zone = self.zones.get(zone_key)
-            if not zone:
-                if DEBUG:
-                    log.debug("Ignoring target payload for unknown zone key: %s", zone_key)
-                return
-
-            try:
-                value = float(payload)
-            except ValueError:
-                log.warning("Invalid target payload for %s: %s", zone_key, payload)
-                return
-
-            requested_target = self.snap_target(value)
-            zone.target_temp = requested_target
-            controller_target = self.calculate_offset_adjusted_target(zone, requested_target)
-            self.enqueue_set_zone_target(zone, controller_target)
-            self.publish_state(zone)
         except Exception as exc:
             log.error("MQTT message handling failed for topic %s: %s", topic, exc)
+
+    def handle_set_target_command(self, zone_key: str, payload: str) -> None:
+        if not payload:
+            if DEBUG and not self.suppress_empty_command_logs:
+                log.debug("Ignoring empty target payload for %s", zone_key)
+            return
+
+        zone = self.zones.get(zone_key)
+        if not zone:
+            if DEBUG:
+                log.debug("Ignoring target payload for unknown zone key: %s", zone_key)
+            return
+
+        try:
+            value = float(payload)
+        except ValueError:
+            log.warning("Invalid target payload for %s: %s", zone_key, payload)
+            return
+
+        requested_target = self.snap_target(value)
+        zone.target_temp = requested_target
+        controller_target = self.calculate_offset_adjusted_target(zone, requested_target)
+        self.enqueue_set_zone_target(zone, controller_target)
+        self.publish_state(zone)
+
+    def handle_booking_command(self, zone_key: str, field_name: str, payload: str) -> None:
+        if not payload:
+            if DEBUG and not self.suppress_empty_command_logs:
+                log.debug("Ignoring empty booking payload for %s (%s)", zone_key, field_name)
+            return
+
+        zone = self.zones.get(zone_key)
+        if not zone:
+            if DEBUG:
+                log.debug("Ignoring booking payload for unknown zone key: %s", zone_key)
+            return
+
+        if field_name == "state":
+            parsed_state = self.parse_booking_state(payload)
+            if parsed_state is None:
+                log.warning("Invalid booking state payload for %s: %s", zone_key, payload)
+                return
+
+            zone.booking_state = parsed_state
+            self.persist_booking_zone_state()
+            self.publish_booking_state(zone)
+            self.maybe_apply_booking_target(zone, "manual_state")
+            return
+
+        try:
+            value = float(payload)
+        except ValueError:
+            log.warning("Invalid booking %s payload for %s: %s", field_name, zone_key, payload)
+            return
+
+        snapped = self.snap_target(value)
+        if field_name == "on_temp":
+            zone.booking_on_temp = snapped
+        else:
+            zone.booking_off_temp = snapped
+
+        self.persist_booking_zone_state()
+        self.publish_booking_temperatures(zone)
+        self.publish_state(zone)
+        self.maybe_apply_booking_target(zone, f"{field_name}_update")
 
     def build_hmpd_cmd(self, controller: Controller, action_args: List[str]) -> List[str]:
         hmpd = self.ensure_hmpd()
@@ -1152,7 +1428,7 @@ class HMPDBridge:
             "temperature_command_topic": command_topic,
             "mode_state_topic": state_topic,
             "mode_state_template": "{{ value_json.mode }}",
-            "modes": ["heat"],
+            "modes": ["off", "heat"],
             "action_topic": state_topic,
             "action_template": "{{ value_json.action }}",
             "min_temp": self.temp_min,
@@ -1168,6 +1444,89 @@ class HMPDBridge:
             "suggested_area": zone.controller_name,
         }
 
+    def booking_discovery_payload(self, zone: Zone) -> dict:
+        object_id = f"hmpd_{zone.unique_id}_booking"
+        return {
+            "name": f"{zone.zone_name} Booked",
+            "object_id": object_id,
+            "unique_id": object_id,
+            "availability_topic": f"{self.base_topic}/bridge/status",
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "state_topic": self.booking_state_topic(zone.unique_id),
+            "command_topic": self.booking_state_command_topic(zone.unique_id),
+            "state_on": "on",
+            "state_off": "off",
+            "payload_on": "on",
+            "payload_off": "off",
+            "icon": "mdi:calendar-check",
+            "device": {
+                "identifiers": [f"hmpd_{zone.unique_id}"],
+                "name": zone.zone_name,
+                "manufacturer": "HMPD",
+                "model": "Thermostat Regulator",
+                "via_device": f"hmpd_bridge_{zone.controller_key}",
+            },
+            "suggested_area": zone.controller_name,
+        }
+
+    def booking_on_temp_discovery_payload(self, zone: Zone) -> dict:
+        object_id = f"hmpd_{zone.unique_id}_booking_on_temp"
+        return {
+            "name": f"{zone.zone_name} Booking On Temp",
+            "object_id": object_id,
+            "unique_id": object_id,
+            "availability_topic": f"{self.base_topic}/bridge/status",
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "state_topic": self.booking_on_temp_state_topic(zone.unique_id),
+            "command_topic": self.booking_on_temp_command_topic(zone.unique_id),
+            "min": self.temp_min,
+            "max": self.temp_max,
+            "step": self.temp_step,
+            "mode": "box",
+            "unit_of_measurement": "C",
+            "device": {
+                "identifiers": [f"hmpd_{zone.unique_id}"],
+                "name": zone.zone_name,
+                "manufacturer": "HMPD",
+                "model": "Thermostat Regulator",
+                "via_device": f"hmpd_bridge_{zone.controller_key}",
+            },
+            "suggested_area": zone.controller_name,
+        }
+
+    def booking_off_temp_discovery_payload(self, zone: Zone) -> dict:
+        object_id = f"hmpd_{zone.unique_id}_booking_off_temp"
+        return {
+            "name": f"{zone.zone_name} Booking Off Temp",
+            "object_id": object_id,
+            "unique_id": object_id,
+            "availability_topic": f"{self.base_topic}/bridge/status",
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "state_topic": self.booking_off_temp_state_topic(zone.unique_id),
+            "command_topic": self.booking_off_temp_command_topic(zone.unique_id),
+            "min": self.temp_min,
+            "max": self.temp_max,
+            "step": self.temp_step,
+            "mode": "box",
+            "unit_of_measurement": "C",
+            "device": {
+                "identifiers": [f"hmpd_{zone.unique_id}"],
+                "name": zone.zone_name,
+                "manufacturer": "HMPD",
+                "model": "Thermostat Regulator",
+                "via_device": f"hmpd_bridge_{zone.controller_key}",
+            },
+            "suggested_area": zone.controller_name,
+        }
+
+    def is_zone_off_mode(self, zone: Zone) -> bool:
+        if zone.target_temp is None:
+            return False
+        return zone.target_temp <= OFF_MODE_TARGET_THRESHOLD
+
     def publish_bridge_status(self, online: bool) -> None:
         payload = "online" if online else "offline"
         self.mqtt.publish(f"{self.base_topic}/bridge/status", payload, qos=1, retain=True)
@@ -1176,10 +1535,62 @@ class HMPDBridge:
         topic = self.discovery_topic(zone.unique_id)
         payload = json.dumps(self.discovery_payload(zone), ensure_ascii=False, sort_keys=True)
         if zone.last_discovery_payload == payload and zone.discovered:
-            return
-        self.mqtt.publish(topic, payload, qos=1, retain=self.retain_discovery)
-        zone.last_discovery_payload = payload
-        zone.discovered = True
+            pass
+        else:
+            self.mqtt.publish(topic, payload, qos=1, retain=self.retain_discovery)
+            zone.last_discovery_payload = payload
+            zone.discovered = True
+
+        booking_payload = json.dumps(
+            self.booking_discovery_payload(zone),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if not (zone.booking_discovered and zone.last_booking_discovery_payload == booking_payload):
+            self.mqtt.publish(
+                self.booking_discovery_topic(zone.unique_id),
+                booking_payload,
+                qos=1,
+                retain=self.retain_discovery,
+            )
+            zone.last_booking_discovery_payload = booking_payload
+            zone.booking_discovered = True
+
+        on_temp_payload = json.dumps(
+            self.booking_on_temp_discovery_payload(zone),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if not (
+            zone.booking_on_temp_discovered
+            and zone.last_booking_on_temp_discovery_payload == on_temp_payload
+        ):
+            self.mqtt.publish(
+                self.booking_on_temp_discovery_topic(zone.unique_id),
+                on_temp_payload,
+                qos=1,
+                retain=self.retain_discovery,
+            )
+            zone.last_booking_on_temp_discovery_payload = on_temp_payload
+            zone.booking_on_temp_discovered = True
+
+        off_temp_payload = json.dumps(
+            self.booking_off_temp_discovery_payload(zone),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if not (
+            zone.booking_off_temp_discovered
+            and zone.last_booking_off_temp_discovery_payload == off_temp_payload
+        ):
+            self.mqtt.publish(
+                self.booking_off_temp_discovery_topic(zone.unique_id),
+                off_temp_payload,
+                qos=1,
+                retain=self.retain_discovery,
+            )
+            zone.last_booking_off_temp_discovery_payload = off_temp_payload
+            zone.booking_off_temp_discovered = True
 
     def publish_state(self, zone: Zone) -> None:
         topic = self.state_topic(zone.unique_id)
@@ -1189,16 +1600,24 @@ class HMPDBridge:
         controller_target_temp = zone.controller_target_temp if zone.controller_target_temp is not None else target_temp
         comparison_temp = zone.current_temp if zone.current_temp is not None else current_temp
 
-        if comparison_temp < target_temp:
+        if self.is_zone_off_mode(zone):
+            mode = "off"
+            action = "off"
+        elif comparison_temp < target_temp:
+            mode = "heat"
             action = "heating"
         else:
+            mode = "heat"
             action = "off"
 
         payload_data = {
             "current_temp": current_temp,
             "target_temp": target_temp,
-            "mode": "heat",
+            "mode": mode,
             "action": action,
+            "booking_state": "on" if zone.booking_state else "off",
+            "booking_on_temp": zone.booking_on_temp,
+            "booking_off_temp": zone.booking_off_temp,
         }
 
         if zone.external_sensor_entity_id:
@@ -1215,10 +1634,35 @@ class HMPDBridge:
         self.mqtt.publish(topic, payload, qos=1, retain=self.retain_state)
         zone.last_state_payload = payload
 
+    def publish_booking_state(self, zone: Zone) -> None:
+        topic = self.booking_state_topic(zone.unique_id)
+        payload = "on" if zone.booking_state else "off"
+
+        if zone.last_booking_state_payload == payload:
+            return
+
+        self.mqtt.publish(topic, payload, qos=1, retain=self.retain_state)
+        zone.last_booking_state_payload = payload
+
+    def publish_booking_temperatures(self, zone: Zone) -> None:
+        on_topic = self.booking_on_temp_state_topic(zone.unique_id)
+        off_topic = self.booking_off_temp_state_topic(zone.unique_id)
+        on_payload = f"{self.snap_target(zone.booking_on_temp):.1f}"
+        off_payload = f"{self.snap_target(zone.booking_off_temp):.1f}"
+
+        if zone.last_booking_on_temp_payload != on_payload:
+            self.mqtt.publish(on_topic, on_payload, qos=1, retain=self.retain_state)
+            zone.last_booking_on_temp_payload = on_payload
+
+        if zone.last_booking_off_temp_payload != off_payload:
+            self.mqtt.publish(off_topic, off_payload, qos=1, retain=self.retain_state)
+            zone.last_booking_off_temp_payload = off_payload
+
     def remove_zone(self, unique_id: str) -> None:
         self.cleanup_unique_id(unique_id)
         if unique_id in self.zones:
             del self.zones[unique_id]
+            self.persist_booking_zone_state()
         log.info("Removed thermostat %s", unique_id)
 
     def apply_temps_result(self, controller: Controller, lines: List[str]) -> None:
@@ -1275,6 +1719,8 @@ class HMPDBridge:
             valid_unique_ids.add(unique_id)
             zone = self.zones.get(unique_id)
             seen_zone_names[name.casefold()] = seen_zone_names.get(name.casefold(), 0) + 1
+            booking_entity_id = self.get_booking_entity_id(controller.name, idx)
+            saved_on_temp, saved_off_temp, saved_state = self.get_saved_booking_values(unique_id)
 
             if zone is None:
                 zone = Zone(
@@ -1290,6 +1736,10 @@ class HMPDBridge:
                     target_temp=data["target_temp"],
                     enabled=data["enabled"],
                     external_sensor_entity_id=self.get_external_sensor_entity_id(controller.name, idx),
+                    booking_entity_id=booking_entity_id,
+                    booking_state=saved_state,
+                    booking_on_temp=saved_on_temp,
+                    booking_off_temp=saved_off_temp,
                 )
                 self.zones[unique_id] = zone
                 created += 1
@@ -1302,14 +1752,21 @@ class HMPDBridge:
                     if zone.target_temp is None or not self.uses_external_sensor(zone):
                         zone.target_temp = data["target_temp"]
                 zone.enabled = data["enabled"]
+                zone.booking_entity_id = booking_entity_id
+                zone.booking_on_temp = self.snap_target(zone.booking_on_temp)
+                zone.booking_off_temp = self.snap_target(zone.booking_off_temp)
                 updated += 1
 
             self.apply_external_sensor_temperature(zone)
             inferred_target = self.infer_display_target_from_controller_target(zone)
             if inferred_target is not None and zone.target_temp is None:
                 zone.target_temp = inferred_target
+
+            self.maybe_apply_booking_target(zone, "regs_sync")
             self.maybe_enqueue_offset_adjustment(zone, "regs_sync")
             self.publish_discovery(zone)
+            self.publish_booking_state(zone)
+            self.publish_booking_temperatures(zone)
             self.publish_state(zone)
 
         stale_for_controller = [
@@ -1319,6 +1776,8 @@ class HMPDBridge:
         ]
         for unique_id in stale_for_controller:
             self.remove_zone(unique_id)
+
+        self.persist_booking_zone_state()
 
         duplicate_names = sorted(name for name, count in seen_zone_names.items() if count > 1)
         if duplicate_names:
@@ -1356,6 +1815,8 @@ class HMPDBridge:
             self.sync_temps_blocking(controller, "startup_initial_current_temp_sync")
         for controller in self.controllers:
             self.sync_regs_blocking(controller, "startup_initial_target_sync")
+
+        self.sync_booking_states_from_home_assistant()
 
     def scheduler_loop(self) -> None:
         while True:
@@ -1400,6 +1861,10 @@ class HMPDBridge:
                             wait=False,
                         )
 
+            if now >= self.next_booking_sync_at:
+                self.sync_booking_states_from_home_assistant()
+                self.next_booking_sync_at = now + self.booking_sync_interval
+
             time.sleep(1.0)
 
     def start(self):
@@ -1425,6 +1890,7 @@ class HMPDBridge:
         for controller in self.controllers:
             self.next_temp_sync_at[controller.key] = now + self.current_temp_sync_interval
             self.next_target_sync_at[controller.key] = now + self.target_sync_interval
+        self.next_booking_sync_at = now + self.booking_sync_interval
 
         self.scheduler_loop()
 
