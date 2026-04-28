@@ -317,6 +317,14 @@ class HMPDBridge:
     def normalize_ascii(self, value: str) -> str:
         return unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
 
+    def create_zone(self, **kwargs) -> Zone:
+        valid_fields = set(Zone.__dataclass_fields__.keys())
+        filtered = {k: v for k, v in kwargs.items() if k in valid_fields}
+        dropped = sorted(set(kwargs.keys()) - valid_fields)
+        if dropped:
+            log.warning("Ignoring unknown Zone fields during creation: %s", ", ".join(dropped))
+        return Zone(**filtered)
+
     def slugify(self, value: str) -> str:
         value = self.normalize_ascii(value).strip().lower()
         value = re.sub(r"[^a-z0-9]+", "_", value)
@@ -1860,7 +1868,7 @@ class HMPDBridge:
             saved_on_temp, saved_off_temp, saved_state = self.get_saved_booking_values(unique_id)
 
             if zone is None:
-                zone = Zone(
+                zone = self.create_zone(
                     controller_name=controller.name,
                     controller_key=controller.key,
                     controller_dev=controller.dev,
