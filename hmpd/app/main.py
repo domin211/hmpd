@@ -1,5 +1,6 @@
 import json
 import logging
+import logging.handlers
 import os
 import re
 import shlex
@@ -49,7 +50,7 @@ RETRY_DELAYS_SECONDS = [5, 10, 60, 60]
 
 TEMP_MIN = 16.0
 TEMP_MAX = 32.0
-TEMP_STEP = 0.5
+TEMP_STEP = 1.0
 OFF_MODE_TARGET_THRESHOLD = 18.0
 
 BOOKING_SYNC_INTERVAL = 60
@@ -70,6 +71,8 @@ RETAIN_DISCOVERY = True
 RETAIN_STATE = True
 
 DEBUG_LOG_FILE = "/config/hmpd_bridge.log"
+DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024  # 10MB per file
+DEBUG_LOG_BACKUP_COUNT = 5  # Keep 5 rotated backups = 60MB total max
 MAX_ZONE_INDEX = 64
 
 
@@ -91,28 +94,22 @@ logging.basicConfig(
 )
 log = logging.getLogger("hmpd_bridge")
 
-
-def append_debug_file(message: str) -> None:
-    if not DEBUG:
-        return
+# Add rotating file handler for debug logging
+if DEBUG:
     try:
         os.makedirs(os.path.dirname(DEBUG_LOG_FILE), exist_ok=True)
-        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(message.rstrip() + "\n")
+        fh = logging.handlers.RotatingFileHandler(
+            DEBUG_LOG_FILE,
+            maxBytes=DEBUG_LOG_MAX_BYTES,
+            backupCount=DEBUG_LOG_BACKUP_COUNT,
+        )
+        fh.setLevel(LOG_LEVEL)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logging.getLogger().addHandler(fh)
+        log.info("Debug logging to %s with rotation (max %dMB, %d backups)", 
+                 DEBUG_LOG_FILE, DEBUG_LOG_MAX_BYTES // (1024*1024), DEBUG_LOG_BACKUP_COUNT)
     except Exception as exc:
-        log.warning("Could not write debug file %s: %s", DEBUG_LOG_FILE, exc)
-
-
-class FileLoggerHandler(logging.Handler):
-    def emit(self, record):
-        append_debug_file(self.format(record))
-
-
-if DEBUG:
-    fh = FileLoggerHandler()
-    fh.setLevel(LOG_LEVEL)
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logging.getLogger().addHandler(fh)
+        log.warning("Could not setup debug file handler: %s", exc)
 
 
 @dataclass(frozen=True)
@@ -145,21 +142,8 @@ class Zone:
     target_temp: Optional[float] = None
     enabled: Optional[bool] = None
     external_sensor_entity_id: Optional[str] = None
-    booking_entity_id: Optional[str] = None
-    booking_state: Optional[bool] = None
-    booking_on_temp: float = BOOKING_ON_TEMP_DEFAULT
-    booking_off_temp: float = BOOKING_OFF_TEMP_DEFAULT
-    discovered: bool = False
-    booking_discovered: bool = False
-    booking_on_temp_discovered: bool = False
-    booking_off_temp_discovered: bool = False
-    last_discovery_payload: Optional[str] = None
-    last_booking_discovery_payload: Optional[str] = None
-    last_booking_on_temp_discovery_payload: Optional[str] = None
-    last_booking_off_temp_discovery_payload: Optional[str] = None
-    last_state_payload: Optional[str] = None
-    last_booking_state_payload: Optional[str] = None
-    last_booking_on_temp_payload: Optional[str] = None
+    booking_entity_ids: List[str] = field(default_factory=list)
+    booking_name: Optional[str] = None
     last_booking_off_temp_payload: Optional[str] = None
     last_offset_adjust_at: float = 0.0
 
@@ -180,55 +164,48 @@ class ControllerJob:
 
 class HMPDBridge:
     def __init__(self):
-        self.discovery_prefix = OPTIONS.get("mqtt_discovery_prefix", MQTT_DISCOVERY_PREFIX)
-        self.base_topic = OPTIONS.get("mqtt_base_topic", MQTT_BASE_TOPIC)
+        # Hardcoded MQTT discovery settings
+        self.discovery_prefix = MQTT_DISCOVERY_PREFIX
+        self.base_topic = MQTT_BASE_TOPIC
 
+        # Configurable MQTT settings
         self.mqtt_host = OPTIONS.get("mqtt_host", MQTT_HOST)
         self.mqtt_port = int(OPTIONS.get("mqtt_port", MQTT_PORT))
         self.mqtt_username = OPTIONS.get("mqtt_username", MQTT_USERNAME)
         self.mqtt_password = OPTIONS.get("mqtt_password", MQTT_PASSWORD)
 
-        self.mqtt_client_id = OPTIONS.get("mqtt_client_id", MQTT_CLIENT_ID)
-        self.mqtt_keepalive = int(OPTIONS.get("mqtt_keepalive", MQTT_KEEPALIVE))
-        self.mqtt_retry_seconds = int(OPTIONS.get("mqtt_retry_seconds", MQTT_RETRY_SECONDS))
+        self.mqtt_client_id = MQTT_CLIENT_ID
+        self.mqtt_keepalive = MQTT_KEEPALIVE
+        self.mqtt_retry_seconds = MQTT_RETRY_SECONDS
+        
+        # Shutdown signal
+        self.shutdown_event = threading.Event()
 
-        self.current_temp_sync_interval = int(
-            OPTIONS.get("current_temp_sync_interval", CURRENT_TEMP_SYNC_INTERVAL)
-        )
-        self.target_sync_interval = int(
-            OPTIONS.get("target_sync_interval", TARGET_SYNC_INTERVAL)
-        )
-        self.auto_offset_cooldown_seconds = int(
-            OPTIONS.get("auto_offset_cooldown_seconds", AUTO_OFFSET_COOLDOWN_SECONDS)
-        )
-        self.external_sensor_target_offset = float(
-            OPTIONS.get("external_sensor_target_offset", EXTERNAL_SENSOR_TARGET_OFFSET)
-        )
+        # Hardcoded sync intervals
+        self.current_temp_sync_interval = CURRENT_TEMP_SYNC_INTERVAL
+        self.target_sync_interval = TARGET_SYNC_INTERVAL
+        self.auto_offset_cooldown_seconds = AUTO_OFFSET_COOLDOWN_SECONDS
+        self.external_sensor_target_offset = EXTERNAL_SENSOR_TARGET_OFFSET
 
-        self.temps_timeout = int(OPTIONS.get("temps_timeout", TEMPS_TIMEOUT))
-        self.regs_timeout = int(OPTIONS.get("regs_timeout", REGS_TIMEOUT))
-        self.set_timeout = int(OPTIONS.get("set_timeout", SET_TIMEOUT))
+        # Hardcoded timeouts
+        self.temps_timeout = TEMPS_TIMEOUT
+        self.regs_timeout = REGS_TIMEOUT
+        self.set_timeout = SET_TIMEOUT
 
-        self.command_gap_seconds = float(OPTIONS.get("command_gap_seconds", COMMAND_GAP_SECONDS))
-        self.max_command_attempts = int(OPTIONS.get("max_command_attempts", MAX_COMMAND_ATTEMPTS))
-        self.retry_delays_seconds = [
-            int(x) for x in OPTIONS.get("retry_delays_seconds", RETRY_DELAYS_SECONDS)
-        ]
+        # Hardcoded command settings
+        self.command_gap_seconds = COMMAND_GAP_SECONDS
+        self.max_command_attempts = MAX_COMMAND_ATTEMPTS
+        self.retry_delays_seconds = RETRY_DELAYS_SECONDS
 
-        self.temp_min = float(OPTIONS.get("temp_min", TEMP_MIN))
-        self.temp_max = float(OPTIONS.get("temp_max", TEMP_MAX))
-        self.temp_step = float(OPTIONS.get("temp_step", TEMP_STEP))
-        self.booking_sync_interval = int(
-            OPTIONS.get("booking_sync_interval", BOOKING_SYNC_INTERVAL)
-        )
-        self.booking_on_temp_default = self.snap_target(
-            float(OPTIONS.get("booking_on_temp_default", BOOKING_ON_TEMP_DEFAULT))
-        )
-        self.booking_off_temp_default = self.snap_target(
-            float(OPTIONS.get("booking_off_temp_default", BOOKING_OFF_TEMP_DEFAULT))
-        )
-        self.retain_discovery = bool(OPTIONS.get("retain_discovery", RETAIN_DISCOVERY))
-        self.retain_state = bool(OPTIONS.get("retain_state", RETAIN_STATE))
+        # Hardcoded temperature settings
+        self.temp_min = TEMP_MIN
+        self.temp_max = TEMP_MAX
+        self.temp_step = TEMP_STEP
+        self.booking_sync_interval = BOOKING_SYNC_INTERVAL
+        self.booking_on_temp_default = self.snap_target(BOOKING_ON_TEMP_DEFAULT)
+        self.booking_off_temp_default = self.snap_target(BOOKING_OFF_TEMP_DEFAULT)
+        self.retain_discovery = RETAIN_DISCOVERY
+        self.retain_state = RETAIN_STATE
         self.configured_hmpd_path = OPTIONS.get("hmpd_path", HMPD_PATH)
 
         self.ha_api_url = OPTIONS.get("home_assistant_api_url", HOME_ASSISTANT_API_URL).rstrip("/")
@@ -241,7 +218,9 @@ class HMPDBridge:
             OPTIONS.get("booking_status_entities", [])
         )
         self.saved_booking_zone_state = self.load_saved_booking_zone_state()
+        # Track which external sensors have warning issues - cleared periodically to avoid memory leak
         self.external_sensor_warnings_shown: Set[Tuple[str, int]] = set()
+        self.last_external_sensor_warning_clear = time.monotonic()
 
         configured_controllers = OPTIONS.get("controllers", CONTROLLERS)
         self.controllers: List[Controller] = [
@@ -353,38 +332,76 @@ class HMPDBridge:
             return entity_id
         return None
 
-    def build_booking_entity_map(self, configured: List[dict]) -> Dict[Tuple[str, int], str]:
-        mapping: Dict[Tuple[str, int], str] = {}
+    def build_booking_entity_map(self, configured: List[dict]) -> Dict[Tuple[str, int], Tuple[Optional[str], List[str]]]:
+        mapping: Dict[Tuple[str, int], Tuple[Optional[str], List[str]]] = {}
         for item in configured or []:
             if not isinstance(item, dict):
                 continue
 
+            name = str(item.get("name", "")).strip() or None
             controller_name = str(item.get("controller", "")).strip()
-            entity_id = str(item.get("entity_id", "")).strip()
-            zone_raw = item.get("zone")
+            entity_ids_raw = item.get("entity_ids", [])
+            zones_raw = item.get("zones", [])
 
-            if not controller_name or not entity_id or zone_raw in (None, ""):
+            if not controller_name:
                 log.warning(
-                    "Ignoring booking_status_entities entry with missing controller/zone/entity_id: %s",
+                    "Ignoring booking_status_entities entry with missing controller: %s",
                     item,
                 )
                 continue
 
-            try:
-                zone_index = int(zone_raw)
-            except Exception:
-                log.warning("Ignoring booking_status_entities entry with invalid zone %r: %s", zone_raw, item)
+            # Handle entity_ids as list
+            entity_ids: List[str] = []
+            if isinstance(entity_ids_raw, list):
+                entity_ids = [str(e).strip() for e in entity_ids_raw if str(e).strip()]
+            elif isinstance(entity_ids_raw, str):
+                # Support single entity_id string for backward compatibility
+                entity_id = entity_ids_raw.strip()
+                if entity_id:
+                    entity_ids = [entity_id]
+
+            if not entity_ids:
+                log.warning(
+                    "Ignoring booking_status_entities entry with missing entity_ids: %s",
+                    item,
+                )
                 continue
 
-            mapping[(controller_name, zone_index)] = entity_id
+            # Handle zones as array of integers
+            if not isinstance(zones_raw, list):
+                zones_raw = []
+
+            if not zones_raw:
+                log.warning(
+                    "Ignoring booking_status_entities entry with missing zones: %s",
+                    item,
+                )
+                continue
+
+            for zone_raw in zones_raw:
+                try:
+                    zone_index = int(zone_raw)
+                except Exception:
+                    log.warning("Ignoring invalid zone %r in controller %s", zone_raw, controller_name)
+                    continue
+
+                mapping[(controller_name, zone_index)] = (name, entity_ids)
+                if DEBUG:
+                    log.debug(
+                        "Mapped booking %s [%s] -> controller=%s zone=%s",
+                        name or "calendar",
+                        entity_ids[0],
+                        controller_name,
+                        zone_index,
+                    )
 
         return mapping
 
-    def get_booking_entity_id(self, controller_name: str, zone_index: int) -> Optional[str]:
-        entity_id = self.booking_entity_map.get((controller_name, zone_index))
-        if entity_id:
-            return entity_id
-        return None
+    def get_booking_entity_info(self, controller_name: str, zone_index: int) -> Tuple[Optional[str], List[str]]:
+        result = self.booking_entity_map.get((controller_name, zone_index))
+        if result:
+            return result
+        return None, []
 
     def load_saved_booking_zone_state(self) -> Dict[str, dict]:
         try:
@@ -484,13 +501,20 @@ class HMPDBridge:
 
     def sync_booking_states_from_home_assistant(self) -> None:
         for zone in self.zones.values():
-            if zone.booking_entity_id:
-                state = self.fetch_home_assistant_state(zone.booking_entity_id)
-                if state:
-                    booking_state = self.parse_booking_state(state.get("state", ""))
-                    if booking_state is not None and zone.booking_state != booking_state:
-                        zone.booking_state = booking_state
-                        self.persist_booking_zone_state()
+            if zone.booking_entity_ids:
+                # Check all booking entities - if any is "on", booking is active
+                booking_state = False
+                for entity_id in zone.booking_entity_ids:
+                    state = self.fetch_home_assistant_state(entity_id)
+                    if state:
+                        entity_state = self.parse_booking_state(state.get("state", ""))
+                        if entity_state:
+                            booking_state = True
+                            break
+                
+                if booking_state != zone.booking_state:
+                    zone.booking_state = booking_state
+                    self.persist_booking_zone_state()
                 self.maybe_apply_booking_target(zone, "calendar_sync")
 
             self.publish_booking_state(zone)
@@ -568,6 +592,13 @@ class HMPDBridge:
         key = (zone.controller_name, zone.zone_index)
         self.external_sensor_warnings_shown.discard(key)
         zone.current_temp = external_temp
+        
+        # Periodically clear warnings set to prevent memory leak
+        now = time.monotonic()
+        if (now - self.last_external_sensor_warning_clear) > 3600:  # Clear every hour
+            self.external_sensor_warnings_shown.clear()
+            self.last_external_sensor_warning_clear = now
+        
         return True
 
     def uses_external_sensor(self, zone: Zone) -> bool:
@@ -950,7 +981,7 @@ class HMPDBridge:
         return self.find_hmpd()
 
     def mqtt_connect_loop(self) -> None:
-        while True:
+        while not self.shutdown_event.is_set():
             try:
                 log.info("Connecting to MQTT broker %s:%s", self.mqtt_host, self.mqtt_port)
                 self.mqtt_connected = False
@@ -959,7 +990,7 @@ class HMPDBridge:
 
                 timeout = time.time() + 10
                 while time.time() < timeout:
-                    if self.mqtt_connected:
+                    if self.mqtt_connected or self.shutdown_event.is_set():
                         return
                     time.sleep(0.2)
 
@@ -970,8 +1001,13 @@ class HMPDBridge:
                 except Exception:
                     pass
             except Exception as exc:
-                log.error("MQTT connect failed: %s", exc)
-            time.sleep(self.mqtt_retry_seconds)
+                log.error("MQTT connect failed: %s", exc, exc_info=True)
+            
+            # Sleep with periodic shutdown checks
+            for _ in range(self.mqtt_retry_seconds):
+                if self.shutdown_event.is_set():
+                    break
+                time.sleep(1.0)
 
     def ensure_mqtt_connected(self) -> None:
         if self.mqtt_connected:
@@ -1105,11 +1141,18 @@ class HMPDBridge:
         for controller in self.controllers:
             if controller.key in self.queue_threads:
                 continue
+            
+            # Check if previous thread died
+            if controller.key in self.queue_threads:
+                old_thread = self.queue_threads[controller.key]
+                if not old_thread.is_alive():
+                    log.critical("Previous worker thread for %s died! Restarting...", controller.name)
+            
             thread = threading.Thread(
                 target=self.controller_worker_loop,
                 args=(controller,),
                 name=f"hmpd_worker_{controller.key}",
-                daemon=True,
+                daemon=False,  # Not daemon - explicit shutdown required
             )
             self.queue_threads[controller.key] = thread
             thread.start()
@@ -1151,33 +1194,50 @@ class HMPDBridge:
 
         job.done.wait()
         if job.error is not None:
-            raise job.error
+            error = job.error
+            job.error = None  # Clear to prevent memory leak
+            raise error
         return job.result_lines, job.result_partial
 
     def controller_worker_loop(self, controller: Controller) -> None:
         cond = self.queue_conditions[controller.key]
-        while True:
-            with cond:
-                while not self.queue_items[controller.key]:
-                    cond.wait()
-                job = self.queue_items[controller.key].pop(0)
-
-            self.current_job_kind[controller.key] = job.kind
+        while not self.shutdown_event.is_set():
             try:
-                self.execute_job_with_retries(controller, job)
+                with cond:
+                    while not self.queue_items[controller.key] and not self.shutdown_event.is_set():
+                        cond.wait(timeout=1.0)  # Timeout to check shutdown signal periodically
+                    if self.shutdown_event.is_set():
+                        break
+                    if not self.queue_items[controller.key]:
+                        continue
+                    job = self.queue_items[controller.key].pop(0)
+
+                self.current_job_kind[controller.key] = job.kind
+                try:
+                    self.execute_job_with_retries(controller, job)
+                except Exception as exc:
+                    job.error = exc
+                    log.error(
+                        "Queue job failed permanently kind=%s controller=%s reason=%s err=%s",
+                        job.kind,
+                        controller.name,
+                        job.reason or "-",
+                        exc,
+                        exc_info=True,  # Log full traceback for debugging
+                    )
+                finally:
+                    self.last_command_finished_at[controller.key] = time.monotonic()
+                    self.current_job_kind[controller.key] = None
+                    job.done.set()
             except Exception as exc:
-                job.error = exc
-                log.error(
-                    "Queue job failed permanently kind=%s controller=%s reason=%s err=%s",
-                    job.kind,
+                log.critical(
+                    "Unhandled exception in controller worker %s: %s",
                     controller.name,
-                    job.reason or "-",
                     exc,
+                    exc_info=True,
                 )
-            finally:
-                self.last_command_finished_at[controller.key] = time.monotonic()
-                self.current_job_kind[controller.key] = None
-                job.done.set()
+                time.sleep(5.0)  # Avoid spinning if something goes very wrong
+        log.info("Controller worker loop exiting for %s", controller.name)
 
     def enforce_command_gap(self, controller: Controller) -> None:
         last_finished = self.last_command_finished_at.get(controller.key, 0.0)
@@ -1766,7 +1826,7 @@ class HMPDBridge:
             valid_unique_ids.add(unique_id)
             zone = self.zones.get(unique_id)
             seen_zone_names[name.casefold()] = seen_zone_names.get(name.casefold(), 0) + 1
-            booking_entity_id = self.get_booking_entity_id(controller.name, idx)
+            booking_name, booking_entity_ids = self.get_booking_entity_info(controller.name, idx)
             saved_on_temp, saved_off_temp, saved_state = self.get_saved_booking_values(unique_id)
 
             if zone is None:
@@ -1783,7 +1843,8 @@ class HMPDBridge:
                     target_temp=data["target_temp"],
                     enabled=data["enabled"],
                     external_sensor_entity_id=self.get_external_sensor_entity_id(controller.name, idx),
-                    booking_entity_id=booking_entity_id,
+                    booking_entity_ids=booking_entity_ids,
+                    booking_name=booking_name,
                     booking_state=saved_state,
                     booking_on_temp=saved_on_temp,
                     booking_off_temp=saved_off_temp,
@@ -1799,7 +1860,8 @@ class HMPDBridge:
                     if zone.target_temp is None or not self.uses_external_sensor(zone):
                         zone.target_temp = data["target_temp"]
                 zone.enabled = data["enabled"]
-                zone.booking_entity_id = booking_entity_id
+                zone.booking_entity_ids = booking_entity_ids
+                zone.booking_name = booking_name
                 zone.booking_on_temp = self.snap_target(zone.booking_on_temp)
                 zone.booking_off_temp = self.snap_target(zone.booking_off_temp)
                 updated += 1
@@ -1809,7 +1871,7 @@ class HMPDBridge:
             if inferred_target is not None and zone.target_temp is None:
                 zone.target_temp = inferred_target
 
-            if zone.booking_entity_id:
+            if zone.booking_entity_ids:
                 self.maybe_apply_booking_target(zone, "regs_sync")
             self.maybe_enqueue_offset_adjustment(zone, "regs_sync")
             self.publish_discovery(zone)
@@ -1867,81 +1929,170 @@ class HMPDBridge:
         self.sync_booking_states_from_home_assistant()
 
     def scheduler_loop(self) -> None:
-        while True:
-            self.ensure_mqtt_connected()
-            now = time.monotonic()
+        last_health_check = time.monotonic()
+        
+        while not self.shutdown_event.is_set():
+            try:
+                self.ensure_mqtt_connected()
+                now = time.monotonic()
+                
+                # Check worker thread health every 60 seconds
+                if (now - last_health_check) > 60.0:
+                    self._health_check_workers()
+                    last_health_check = now
 
-            for controller in self.controllers:
-                controller_key = controller.key
+                for controller in self.controllers:
+                    controller_key = controller.key
 
-                if now >= self.next_temp_sync_at[controller_key]:
-                    if not self.is_job_kind_active_or_queued(controller_key, "temps"):
-                        self.enqueue_controller_job(
-                            controller,
-                            ControllerJob(
-                                kind="temps",
-                                action_args=["temps"],
-                                timeout=self.temps_timeout,
-                                reason="scheduled_current_temp_sync",
-                            ),
-                            wait=False,
-                        )
-
-                if now >= self.next_target_sync_at[controller_key]:
-                    pending_sets = self.pending_set_count(controller_key)
-                    set_running = self.current_job_kind.get(controller_key) == "set"
-
-                    if pending_sets > 0 or set_running:
-                        if DEBUG:
-                            log.debug(
-                                "Delaying target sync for %s because set command(s) are queued or running",
-                                controller.name,
+                    if now >= self.next_temp_sync_at[controller_key]:
+                        if not self.is_job_kind_active_or_queued(controller_key, "temps"):
+                            self.enqueue_controller_job(
+                                controller,
+                                ControllerJob(
+                                    kind="temps",
+                                    action_args=["temps"],
+                                    timeout=self.temps_timeout,
+                                    reason="scheduled_current_temp_sync",
+                                ),
+                                wait=False,
                             )
-                    elif not self.is_job_kind_active_or_queued(controller_key, "regs"):
-                        self.enqueue_controller_job(
-                            controller,
-                            ControllerJob(
-                                kind="regs",
-                                action_args=["regs"],
-                                timeout=self.regs_timeout,
-                                reason="scheduled_target_sync",
-                            ),
-                            wait=False,
-                        )
 
-            if now >= self.next_booking_sync_at:
-                self.sync_booking_states_from_home_assistant()
-                self.next_booking_sync_at = now + self.booking_sync_interval
+                    if now >= self.next_target_sync_at[controller_key]:
+                        pending_sets = self.pending_set_count(controller_key)
+                        set_running = self.current_job_kind.get(controller_key) == "set"
 
-            time.sleep(1.0)
+                        if pending_sets > 0 or set_running:
+                            if DEBUG:
+                                log.debug(
+                                    "Delaying target sync for %s because set command(s) are queued or running",
+                                    controller.name,
+                                )
+                        elif not self.is_job_kind_active_or_queued(controller_key, "regs"):
+                            self.enqueue_controller_job(
+                                controller,
+                                ControllerJob(
+                                    kind="regs",
+                                    action_args=["regs"],
+                                    timeout=self.regs_timeout,
+                                    reason="scheduled_target_sync",
+                                ),
+                                wait=False,
+                            )
+
+                if now >= self.next_booking_sync_at:
+                    self.sync_booking_states_from_home_assistant()
+                    self.next_booking_sync_at = now + self.booking_sync_interval
+
+                time.sleep(1.0)
+            except Exception as exc:
+                log.critical(
+                    "Unhandled exception in scheduler loop: %s - recovering...",
+                    exc,
+                    exc_info=True,
+                )
+                time.sleep(5.0)  # Brief pause before recovery
+                # Try to re-establish MQTT connection on recovery
+                self.mqtt_connected = False
+        
+        log.info("Scheduler loop exiting")
+
+    def _health_check_workers(self) -> None:
+        """Check worker threads are alive, restart if dead"""
+        for controller in self.controllers:
+            thread = self.queue_threads.get(controller.key)
+            if thread and not thread.is_alive():
+                log.critical(
+                    "Worker thread for controller %s is DEAD! Restarting immediately...",
+                    controller.name,
+                )
+                # Restart the worker
+                new_thread = threading.Thread(
+                    target=self.controller_worker_loop,
+                    args=(controller,),
+                    name=f"hmpd_worker_{controller.key}",
+                    daemon=False,
+                )
+                self.queue_threads[controller.key] = new_thread
+                new_thread.start()
 
     def start(self):
-        self.wait_for_hmpd()
-        log.info("=== HMPD Thermostat Bridge starting ===")
-        for controller in self.controllers:
-            log.info(
-                "Configured controller %s -> %s @ %s (key=%s, expected_regs=%s)",
-                controller.name,
-                controller.dev,
-                controller.baud,
-                controller.key,
-                controller.expected_regs,
+        try:
+            self.wait_for_hmpd()
+            log.info("=== HMPD Thermostat Bridge starting ===")
+            for controller in self.controllers:
+                log.info(
+                    "Configured controller %s -> %s @ %s (key=%s, expected_regs=%s)",
+                    controller.name,
+                    controller.dev,
+                    controller.baud,
+                    controller.key,
+                    controller.expected_regs,
+                )
+
+            self.start_controller_workers()
+            self.mqtt_connect_loop()
+            self.publish_bridge_status(True)
+
+            try:
+                self.force_full_republish()
+            except Exception as exc:
+                log.error(
+                    "Initial republish failed (will retry on next sync): %s",
+                    exc,
+                    exc_info=True,
+                )
+
+            now = time.monotonic()
+            for controller in self.controllers:
+                self.next_temp_sync_at[controller.key] = now + self.current_temp_sync_interval
+                self.next_target_sync_at[controller.key] = now + self.target_sync_interval
+            self.next_booking_sync_at = now + self.booking_sync_interval
+
+            self.scheduler_loop()
+        except Exception as exc:
+            log.critical(
+                "Fatal error in start: %s",
+                exc,
+                exc_info=True,
             )
-
-        self.start_controller_workers()
-        self.mqtt_connect_loop()
-        self.publish_bridge_status(True)
-
-        self.force_full_republish()
-
-        now = time.monotonic()
-        for controller in self.controllers:
-            self.next_temp_sync_at[controller.key] = now + self.current_temp_sync_interval
-            self.next_target_sync_at[controller.key] = now + self.target_sync_interval
-        self.next_booking_sync_at = now + self.booking_sync_interval
-
-        self.scheduler_loop()
+            raise
+        finally:
+            log.info("Shutting down HMPD Bridge")
+            self.shutdown_event.set()
+            
+            # Signal all worker threads to stop and wait for them
+            for controller in self.controllers:
+                cond = self.queue_conditions[controller.key]
+                with cond:
+                    cond.notify_all()  # Wake up any waiting workers
+            
+            # Wait for worker threads to exit (max 10 seconds)
+            deadline = time.time() + 10.0
+            for controller in self.controllers:
+                thread = self.queue_threads.get(controller.key)
+                if thread:
+                    remaining = max(0.1, deadline - time.time())
+                    thread.join(timeout=remaining)
+                    if thread.is_alive():
+                        log.warning("Worker thread %s did not exit cleanly", controller.name)
+            
+            self.publish_bridge_status(False)
+            try:
+                self.mqtt.loop_stop()
+            except Exception:
+                pass
+            try:
+                self.mqtt.disconnect()
+            except Exception:
+                pass
+            log.info("HMPD Bridge shutdown complete")
 
 
 if __name__ == "__main__":
-    HMPDBridge().start()
+    try:
+        HMPDBridge().start()
+    except KeyboardInterrupt:
+        log.info("Received SIGINT, shutting down gracefully")
+    except Exception as exc:
+        log.critical("Fatal error: %s", exc, exc_info=True)
+        raise

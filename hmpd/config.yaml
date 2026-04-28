@@ -1,6 +1,6 @@
 name: HMPD Thermostat Bridge
 slug: hmpd
-version: "2.4.0"
+version: "3.0.0"
 description: Expose HMPD thermostat zones to Home Assistant as MQTT climate entities
 arch:
   - amd64
@@ -24,30 +24,23 @@ map:
 
 options:
   debug: false
+  
+  # MQTT Configuration (host, port, credentials)
   mqtt_host: core-mosquitto
   mqtt_port: 1883
   mqtt_username: ""
   mqtt_password: ""
-  mqtt_discovery_prefix: homeassistant
-  mqtt_base_topic: hmpd
+  
+  # HMPD Configuration
   hmpd_path: /app/hmpd
-
-  current_temp_sync_interval: 60
-  target_sync_interval: 3600
-  booking_sync_interval: 60
-  auto_offset_cooldown_seconds: 60
-
-  temp_min: 16.0
-  temp_max: 32.0
-  temp_step: 0.5
-
-  booking_on_temp_default: 23.0
-  booking_off_temp_default: 16.0
-  external_sensor_target_offset: 2.0
-
+  
+  # Booking Status Configuration (multiple devices per zone)
   booking_status_entities: []
+  
+  # External Temperature Sensors
   external_temp_sensors: []
-
+  
+  # Controller Configuration
   controllers:
     - name: usb0
       dev: /dev/ttyUSB0
@@ -60,37 +53,30 @@ options:
 
 schema:
   debug: bool
+  
+  # MQTT
   mqtt_host: str
   mqtt_port: port
   mqtt_username: str?
   mqtt_password: password?
-  mqtt_discovery_prefix: str
-  mqtt_base_topic: str
+  
+  # HMPD
   hmpd_path: str
-
-  current_temp_sync_interval: int(10,)
-  target_sync_interval: int(60,)
-  booking_sync_interval: int(10,)
-  auto_offset_cooldown_seconds: int(1,)
-
-  temp_min: float
-  temp_max: float
-  temp_step: float
-
-  booking_on_temp_default: float
-  booking_off_temp_default: float
-  external_sensor_target_offset: float(0,)
-
+  
+  # Booking Status Entities (multiple zones per calendar on same controller)
   booking_status_entities:
-    - controller: str
-      zone: int(0,)
-      entity_id: match(^[a-z0-9_]+\.[a-z0-9_]+$)
-
+    - name: str?
+      entity_ids: [match(^[a-z0-9_]+\.[a-z0-9_]+$)]
+      controller: str
+      zones: [int(0,)]
+  
+  # External Temperature Sensors
   external_temp_sensors:
     - controller: str
       zone: int(0,)
       entity_id: match(^[a-z0-9_]+\.[a-z0-9_]+$)
-
+  
+  # Controllers
   controllers:
     - name: str
       dev: str
