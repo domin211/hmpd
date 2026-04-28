@@ -66,7 +66,7 @@ schema:
   # Booking Status Entities (multiple zones per calendar on same controller)
   booking_status_entities:
     - name: str?
-      entity_ids: [match(^[a-z0-9_]+\.[a-z0-9_]+$)]
+      entity_ids: ["match(^[a-z0-9_]+\\.[a-z0-9_]+$)"]
       controller: str
       zones: [int(0,)]
   
@@ -74,7 +74,7 @@ schema:
   external_temp_sensors:
     - controller: str
       zone: int(0,)
-      entity_id: match(^[a-z0-9_]+\.[a-z0-9_]+$)
+      entity_id: "match(^[a-z0-9_]+\\.[a-z0-9_]+$)"
   
   # Controllers
   controllers:
