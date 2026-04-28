@@ -203,6 +203,11 @@ This applies to manual target changes and booking-driven targets.
 
 ## Changelog
 
+### v3.0.1 - Supervisor Compatibility Fix (April 2026)
+
+- Removed deprecated `arch` values (`armv7`, `armhf`, `i386`) from add-on metadata
+- Fixed `booking_status_entities` schema list syntax so Supervisor can parse `config.yaml` cleanly
+
 ### v3.0.0 - Production-Ready Release (April 2026)
 
 **Breaking Changes:**
