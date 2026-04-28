@@ -147,6 +147,8 @@ class Zone:
     booking_state: bool = False
     booking_on_temp: float = BOOKING_ON_TEMP_DEFAULT
     booking_off_temp: float = BOOKING_OFF_TEMP_DEFAULT
+    discovered: bool = False
+    last_discovery_payload: Optional[str] = None
     last_state_payload: Optional[str] = None
     last_booking_state_payload: Optional[str] = None
     last_booking_on_temp_payload: Optional[str] = None
@@ -238,8 +240,8 @@ class HMPDBridge:
         self.retain_state = RETAIN_STATE
         self.configured_hmpd_path = OPTIONS.get("hmpd_path", HMPD_PATH)
 
-        self.ha_api_url = OPTIONS.get("home_assistant_api_url", HOME_ASSISTANT_API_URL).rstrip("/")
-        self.ha_sensor_timeout = int(OPTIONS.get("home_assistant_sensor_timeout", HOME_ASSISTANT_SENSOR_TIMEOUT))
+        self.ha_api_url = HOME_ASSISTANT_API_URL.rstrip("/")
+        self.ha_sensor_timeout = HOME_ASSISTANT_SENSOR_TIMEOUT
         self.supervisor_token = os.getenv("SUPERVISOR_TOKEN", "")
         self.external_temp_sensor_map = self.build_external_temp_sensor_map(
             OPTIONS.get("external_temp_sensors", [])
@@ -324,6 +326,29 @@ class HMPDBridge:
         if dropped:
             log.warning("Ignoring unknown Zone fields during creation: %s", ", ".join(dropped))
         return Zone(**filtered)
+
+    def ensure_zone_runtime_fields(self, zone: Zone) -> None:
+        defaults = {
+            "booking_state": False,
+            "booking_on_temp": self.booking_on_temp_default,
+            "booking_off_temp": self.booking_off_temp_default,
+            "discovered": False,
+            "last_discovery_payload": None,
+            "last_state_payload": None,
+            "last_booking_state_payload": None,
+            "last_booking_on_temp_payload": None,
+            "last_booking_off_temp_payload": None,
+            "booking_discovered": False,
+            "booking_on_temp_discovered": False,
+            "booking_off_temp_discovered": False,
+            "last_booking_discovery_payload": None,
+            "last_booking_on_temp_discovery_payload": None,
+            "last_booking_off_temp_discovery_payload": None,
+            "last_offset_adjust_at": 0.0,
+        }
+        for field_name, default_value in defaults.items():
+            if not hasattr(zone, field_name):
+                setattr(zone, field_name, default_value)
 
     def slugify(self, value: str) -> str:
         value = self.normalize_ascii(value).strip().lower()
@@ -1178,13 +1203,10 @@ class HMPDBridge:
     def start_controller_workers(self) -> None:
         for controller in self.controllers:
             if controller.key in self.queue_threads:
-                continue
-            
-            # Check if previous thread died
-            if controller.key in self.queue_threads:
-                old_thread = self.queue_threads[controller.key]
-                if not old_thread.is_alive():
-                    log.critical("Previous worker thread for %s died! Restarting...", controller.name)
+                existing_thread = self.queue_threads[controller.key]
+                if existing_thread.is_alive():
+                    continue
+                log.critical("Previous worker thread for %s died! Restarting...", controller.name)
             
             thread = threading.Thread(
                 target=self.controller_worker_loop,
@@ -1684,6 +1706,7 @@ class HMPDBridge:
         self.mqtt.publish(f"{self.base_topic}/bridge/status", payload, qos=1, retain=True)
 
     def publish_discovery(self, zone: Zone) -> None:
+        self.ensure_zone_runtime_fields(zone)
         topic = self.discovery_topic(zone.unique_id)
         payload = json.dumps(self.discovery_payload(zone), ensure_ascii=False, sort_keys=True)
         if zone.last_discovery_payload == payload and zone.discovered:
@@ -1745,6 +1768,7 @@ class HMPDBridge:
             zone.booking_off_temp_discovered = True
 
     def publish_state(self, zone: Zone) -> None:
+        self.ensure_zone_runtime_fields(zone)
         topic = self.state_topic(zone.unique_id)
 
         current_temp = zone.current_temp if zone.current_temp is not None else self.temp_min
@@ -1780,6 +1804,7 @@ class HMPDBridge:
         zone.last_state_payload = payload
 
     def publish_booking_state(self, zone: Zone) -> None:
+        self.ensure_zone_runtime_fields(zone)
         topic = self.booking_state_topic(zone.unique_id)
         payload = "on" if zone.booking_state else "off"
 
@@ -1790,6 +1815,7 @@ class HMPDBridge:
         zone.last_booking_state_payload = payload
 
     def publish_booking_temperatures(self, zone: Zone) -> None:
+        self.ensure_zone_runtime_fields(zone)
         on_topic = self.booking_on_temp_state_topic(zone.unique_id)
         off_topic = self.booking_off_temp_state_topic(zone.unique_id)
         on_payload = f"{self.snap_target(zone.booking_on_temp):.1f}"

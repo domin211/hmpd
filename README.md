@@ -144,34 +144,37 @@ Notes:
 
 - Home Assistant shows the external sensor as the current temperature.
 - Home Assistant keeps showing the user-requested target temperature.
-- `external_sensor_target_offset` is configurable in add-on options (default `2.0`).
+- External sensor target offset is fixed at `2.0`.
 - The add-on calculates an internal controller target from the difference between the built-in HMPD probe and the external HA sensor, then applies the configured offset directionally: `+offset` when room temperature is below target and `-offset` when room temperature is already at/above target.
-- That internal controller target is re-synced through the existing queue system with a cooldown of `auto_offset_cooldown_seconds` (default `60`).
+- That internal controller target is re-synced through the existing queue system with a fixed cooldown of `60` seconds.
 - If the external sensor becomes unavailable, the add-on falls back to the built-in reading and stops applying offset corrections until the external value is usable again.
 
 
 ## Booking calendar mode (on/off)
 
-You can now assign a Home Assistant on/off entity (for example a `calendar.*` or `input_boolean.*`) to each zone.
+You can now assign one or more Home Assistant on/off entities (for example `calendar.*` or `input_boolean.*`) to a group of zones on a controller.
 The add-on reads that state and automatically applies:
 
 - booking ON target temperature (default `23.0`)
 - booking OFF target temperature (default `16.0`)
 
-Configure global defaults and optional per-zone booking entity mappings:
+Configure global defaults and booking entity mappings:
 
 ```yaml
-booking_sync_interval: 60
 booking_on_temp_default: 23.0
 booking_off_temp_default: 16.0
 
 booking_status_entities:
+  - name: "Room 101 + 102"
+    entity_ids:
+      - calendar.room_101
+      - input_boolean.room_102_booked
+    controller: usb0
+    zones: [1, 2]
   - controller: usb0
-    zone: 1
-    entity_id: calendar.room_101
-  - controller: usb0
-    zone: 2
-    entity_id: input_boolean.room_102_booked
+    entity_ids:
+      - input_boolean.room_103_booked
+    zones: [3]
 ```
 
 Notes:
@@ -203,6 +206,25 @@ This applies to manual target changes and booking-driven targets.
 ---
 
 ## Changelog
+
+### v3.0.7 - Config/Docs Consistency Cleanup (April 2026)
+
+- Removed unsupported hidden HA API option parsing from runtime (now fixed to internal Supervisor defaults)
+- Updated booking and external sensor docs/examples to match current add-on schema and fixed timings
+
+### v3.0.6 - Worker Startup Logic Fix (April 2026)
+
+- Fixed unreachable branch in worker startup code so dead worker threads are correctly detected and restarted
+
+### v3.0.5 - Defensive Zone Field Backfill (April 2026)
+
+- Added runtime `Zone` field backfill guard before discovery/state publishing
+- Prevents worker crashes if a future edit introduces missing `Zone` cache/state attributes
+
+### v3.0.4 - Startup Attribute Crash Fix (April 2026)
+
+- Added missing `Zone` fields `discovered` and `last_discovery_payload` used by MQTT discovery publishing
+- Fixes startup retry loop reporting `'Zone' object has no attribute 'last_discovery_payload'`
 
 ### v3.0.3 - Booking Regression + UI Fix (April 2026)
 
