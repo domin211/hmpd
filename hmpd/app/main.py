@@ -144,7 +144,19 @@ class Zone:
     external_sensor_entity_id: Optional[str] = None
     booking_entity_ids: List[str] = field(default_factory=list)
     booking_name: Optional[str] = None
+    booking_state: bool = False
+    booking_on_temp: float = BOOKING_ON_TEMP_DEFAULT
+    booking_off_temp: float = BOOKING_OFF_TEMP_DEFAULT
+    last_state_payload: Optional[str] = None
+    last_booking_state_payload: Optional[str] = None
+    last_booking_on_temp_payload: Optional[str] = None
     last_booking_off_temp_payload: Optional[str] = None
+    booking_discovered: bool = False
+    booking_on_temp_discovered: bool = False
+    booking_off_temp_discovered: bool = False
+    last_booking_discovery_payload: Optional[str] = None
+    last_booking_on_temp_discovery_payload: Optional[str] = None
+    last_booking_off_temp_discovery_payload: Optional[str] = None
     last_offset_adjust_at: float = 0.0
 
 
@@ -202,8 +214,26 @@ class HMPDBridge:
         self.temp_max = TEMP_MAX
         self.temp_step = TEMP_STEP
         self.booking_sync_interval = BOOKING_SYNC_INTERVAL
-        self.booking_on_temp_default = self.snap_target(BOOKING_ON_TEMP_DEFAULT)
-        self.booking_off_temp_default = self.snap_target(BOOKING_OFF_TEMP_DEFAULT)
+        raw_booking_on = OPTIONS.get("booking_on_temp_default", BOOKING_ON_TEMP_DEFAULT)
+        raw_booking_off = OPTIONS.get("booking_off_temp_default", BOOKING_OFF_TEMP_DEFAULT)
+        try:
+            self.booking_on_temp_default = self.snap_target(float(raw_booking_on))
+        except Exception:
+            log.warning(
+                "Invalid booking_on_temp_default %r; using default %.1f",
+                raw_booking_on,
+                BOOKING_ON_TEMP_DEFAULT,
+            )
+            self.booking_on_temp_default = self.snap_target(BOOKING_ON_TEMP_DEFAULT)
+        try:
+            self.booking_off_temp_default = self.snap_target(float(raw_booking_off))
+        except Exception:
+            log.warning(
+                "Invalid booking_off_temp_default %r; using default %.1f",
+                raw_booking_off,
+                BOOKING_OFF_TEMP_DEFAULT,
+            )
+            self.booking_off_temp_default = self.snap_target(BOOKING_OFF_TEMP_DEFAULT)
         self.retain_discovery = RETAIN_DISCOVERY
         self.retain_state = RETAIN_STATE
         self.configured_hmpd_path = OPTIONS.get("hmpd_path", HMPD_PATH)

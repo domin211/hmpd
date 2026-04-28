@@ -1,6 +1,6 @@
 name: HMPD Thermostat Bridge
 slug: hmpd
-version: "3.0.1"
+version: "3.0.3"
 description: Expose HMPD thermostat zones to Home Assistant as MQTT climate entities
 arch:
   - amd64
@@ -32,6 +32,8 @@ options:
   hmpd_path: /app/hmpd
   
   # Booking Status Configuration (multiple devices per zone)
+  booking_on_temp_default: 23.0
+  booking_off_temp_default: 16.0
   booking_status_entities: []
   
   # External Temperature Sensors
@@ -61,11 +63,15 @@ schema:
   hmpd_path: str
   
   # Booking Status Entities (multiple zones per calendar on same controller)
+  booking_on_temp_default: float(16.0,32.0)
+  booking_off_temp_default: float(16.0,32.0)
   booking_status_entities:
     - name: str?
-      entity_ids: list(match(^[a-z0-9_]+\.[a-z0-9_]+$))
+      entity_ids:
+        - "match(^[a-z0-9_]+\\.[a-z0-9_]+$)"
       controller: str
-      zones: list(int(0,))
+      zones:
+        - "int(0,)"
   
   # External Temperature Sensors
   external_temp_sensors:

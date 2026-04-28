@@ -48,6 +48,8 @@ The add-on has minimal configuration:
 - `mqtt_username`: MQTT username (optional)
 - `mqtt_password`: MQTT password (optional)
 - `hmpd_path`: Path to the hmpd binary (default: /app/hmpd)
+- `booking_on_temp_default`: Default ON target used by booking mode (default: 23.0)
+- `booking_off_temp_default`: Default OFF target used by booking mode (default: 16.0)
 - `controllers`: List of serial controllers (USB devices)
 - `booking_status_entities`: Booking calendar integrations (optional)
 - `external_temp_sensors`: External temperature sensor mappings (optional)
@@ -57,7 +59,6 @@ Hardcoded values:
 - MQTT base topic: `hmpd`
 - Sync intervals: 60s (current temp), 3600s (target), 60s (booking)
 - Temperature range: 16.0°C - 32.0°C with 1.0°C steps
-- Default booking temperatures: 23.0°C (on), 16.0°C (off)
 
 ## Notes
 
@@ -202,6 +203,17 @@ This applies to manual target changes and booking-driven targets.
 ---
 
 ## Changelog
+
+### v3.0.3 - Booking Regression + UI Fix (April 2026)
+
+- Fixed startup crash caused by missing `Zone` fields (`booking_state`, booking temperatures, and payload/discovery caches)
+- Restored `booking_status_entities` options UI usability by changing schema list definitions to editable list-item validators
+
+### v3.0.2 - Configurable Booking Defaults Restored (April 2026)
+
+- Restored add-on options for `booking_on_temp_default` and `booking_off_temp_default`
+- Added schema validation for those options in `config.yaml`
+- Runtime now safely parses configured values with fallback to built-in defaults
 
 ### v3.0.1 - Supervisor Compatibility Fix (April 2026)
 
