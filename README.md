@@ -52,8 +52,6 @@ The add-on has minimal configuration:
 - `booking_on_temp_default`: Default ON target used by booking mode (default: 23.0)
 - `booking_off_temp_default`: Default OFF target used by booking mode (default: 16.0)
 - `controllers`: List of serial controllers (USB devices)
-- `booking_status_entities`: Booking calendar integrations (optional)
-- `external_temp_sensors`: External temperature sensor mappings (optional)
 
 Hardcoded values:
 - MQTT discovery prefix: `homeassistant`
@@ -61,7 +59,7 @@ Hardcoded values:
 - Sync intervals: 60s (current temp), 3600s (target), 60s (booking)
 - Temperature range: 16.0°C - 32.0°C with 1.0°C steps
 
-The `rooms` preset is the easiest setup path. Each room row expands into the booking and external temperature mappings the runtime already understands, so one UI item configures a whole room. Booking on/off temperatures are shared globally, so you only edit them once and every room uses the same values. The zone ids for the built-in room preset are filled in by the add-on and do not need to be edited in the UI.
+The `rooms` preset is the easiest setup path. Each room row expands into the booking and external temperature mappings the runtime already understands, so one UI item configures a whole room. Booking on/off temperatures are shared globally, so you only edit them once and every room uses the same values. The zone ids are now shown again in the UI so they can be reviewed or edited per room.
 
 ## Notes
 
@@ -89,37 +87,6 @@ Each room row does three things:
 - maps the room zone IDs to the correct controller using the built-in room preset
 - uses the external sensor as the current temperature source when `external_sensor_enabled` is `true`
 
-Legacy `booking_status_entities` and `external_temp_sensors` still work, but `rooms` is the recommended path.
-
-## External Temperature Sensors
-
-Use existing Home Assistant sensors as the room temperature source for a zone.
-If no external sensor is configured for a zone, it uses the built-in HMPD reading.
-
-When an external sensor is configured, the add-on also offsets the controller setpoint in the backend so the physical HMPD regulator still stops heating at the right time even though Home Assistant is showing the external room temperature.
-
-Add entries under `external_temp_sensors` in the add-on options:
-
-```yaml
-external_temp_sensors:
-  - controller: usb0
-    zones: 1, 2
-    entity_id: sensor.living_room_temperature
-  - controller: usb1
-    zones: 3
-    entity_id: sensor.office_temperature
-```
-
-Notes:
-
-- `controller` must match the controller `name` in the add-on config.
-- `zones` is a comma-separated list of numeric HMPD zone indexes; the old single `zone` field still works.
-- `entity_id` must be an existing Home Assistant sensor entity.
-- When the external sensor is unavailable or invalid, the add-on falls back to the built-in HMPD temperature for that zone.
-- The add-on reads Home Assistant state through the internal Supervisor Core API proxy using `SUPERVISOR_TOKEN`.
-
-
-
 ### Offset control behavior
 
 - Home Assistant shows the external sensor as the current temperature.
@@ -132,32 +99,10 @@ Notes:
 
 ## Booking calendar mode (on/off)
 
-You can now assign one or more Home Assistant on/off entities (for example `calendar.*` or `input_boolean.*`) to a group of zones on a controller.
-The add-on reads that state and automatically applies:
+Booking is now configured through the `rooms` preset. Each room row links a calendar to a controller and its zones, and the shared booking temperatures below apply to all rooms.
 
 - booking ON target temperature (default `23.0`)
 - booking OFF target temperature (default `16.0`)
-
-Configure global defaults and booking entity mappings:
-
-```yaml
-booking_on_temp_default: 23.0
-booking_off_temp_default: 16.0
-
-booking_status_entities:
-  - name: "Room 101 + 102"
-    entity_ids:
-      - calendar.room_101
-      - input_boolean.room_102_booked
-    controller: usb0
-    zones: [1, 2]
-  - controller: usb0
-    entity_ids:
-      - input_boolean.room_103_booked
-    zones: [3]
-```
-
-Notes:
 
 - The add-on creates visible entities per zone in Home Assistant:
   - `switch`: booking state (`Booked`)
