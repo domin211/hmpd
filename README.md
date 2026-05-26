@@ -187,6 +187,12 @@ This applies to manual target changes and booking-driven targets.
 
 ## Changelog
 
+### v3.0.8 - Room UI Cleanup (May 2026)
+
+- Removed the manual `ids` field from the room UI and use built-in room zone defaults instead
+- Added startup and runtime logs for room expansion, shared booking temperatures, and mapping conflicts
+- Kept booking temperatures shared globally so they can be edited once for all rooms
+
 ### v3.0.7 - Config/Docs Consistency Cleanup (April 2026)
 
 - Removed unsupported hidden HA API option parsing from runtime (now fixed to internal Supervisor defaults)
