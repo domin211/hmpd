@@ -860,7 +860,7 @@ class HMPDBridge:
 
         key = (zone.controller_name, zone.zone_index)
         self.external_sensor_warnings_shown.discard(key)
-    zone.external_current_temp = external_temp
+        zone.external_current_temp = external_temp
         zone.current_temp = external_temp
         
         # Periodically clear warnings set to prevent memory leak
