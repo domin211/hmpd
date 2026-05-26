@@ -48,6 +48,7 @@ The add-on has minimal configuration:
 - `mqtt_username`: MQTT username (optional)
 - `mqtt_password`: MQTT password (optional)
 - `hmpd_path`: Path to the hmpd binary (default: /app/hmpd)
+- `rooms`: Recommended room-based preset entries that combine controller, calendar, external sensor, and zone IDs in one row
 - `booking_on_temp_default`: Default ON target used by booking mode (default: 23.0)
 - `booking_off_temp_default`: Default OFF target used by booking mode (default: 16.0)
 - `controllers`: List of serial controllers (USB devices)
@@ -60,6 +61,8 @@ Hardcoded values:
 - Sync intervals: 60s (current temp), 3600s (target), 60s (booking)
 - Temperature range: 16.0°C - 32.0°C with 1.0°C steps
 
+The `rooms` preset is the easiest setup path. Each room row expands into the booking and external temperature mappings the runtime already understands, so one UI item configures a whole room. Booking on/off temperatures are shared globally, so you only edit them once and every room uses the same values.
+
 ## Notes
 
 - Put your `hmpd` binary next to `configuration.yaml` on the Home Assistant host, so the add-on can read it as `/homeassistant/hmpd`.
@@ -67,49 +70,27 @@ Hardcoded values:
 - The add-on publishes MQTT discovery `climate` entities.
 
 
-## Booking Status Entities
+## Room-Based Presets
 
-Configure booking calendar integrations to automatically set heating based on calendar events. One calendar can control multiple zones on the same controller.
-
-### Example: One calendar for multiple zones
+Use `rooms` when you want one entry to configure a whole room.
 
 ```yaml
-booking_status_entities:
-  - name: "Living Room & Bathroom"
-    entity_ids:
-      - binary_sensor.main_floor_booked
+rooms:
+  - name: room_11
     controller: usb0
-    zones: [1, 2]
+    calendar: calendar.pokoj_11
+    external_sensor: sensor.pokoj_11_teplota
+    external_sensor_enabled: true
+    ids: [18, 19]
 ```
 
-When the calendar is "on", both zones heat to their booking on temperature.
+Each room row does three things:
 
-### Example: Multiple calendars with redundancy
+- maps the calendar to booking control
+- maps the room zone IDs to the correct controller
+- uses the external sensor as the current temperature source when `external_sensor_enabled` is `true`
 
-```yaml
-booking_status_entities:
-  - name: "Main Floor"
-    entity_ids:
-      - binary_sensor.main_floor_booked
-      - binary_sensor.manual_override  # Fallback sensor
-    controller: usb0
-    zones: [1, 2, 3]
-  - name: "Bedroom"
-    entity_ids:
-      - binary_sensor.bedroom_booked
-    controller: usb0
-    zones: [4]
-```
-
-### Notes
-
-- `name` is optional - helps identify the booking configuration
-- `entity_ids` is a list of Home Assistant binary sensor entities (multiple entities for redundancy)
-- `controller` must match the controller `name` in the add-on config
-- `zones` is a list of zone numbers on that controller
-- When any entity is "on", all zones in that entry heat to their booking on temperature
-- When all entities are "off", all zones revert to the booking off temperature
-
+Legacy `booking_status_entities` and `external_temp_sensors` still work, but `rooms` is the recommended path.
 
 ## External Temperature Sensors
 
@@ -123,17 +104,17 @@ Add entries under `external_temp_sensors` in the add-on options:
 ```yaml
 external_temp_sensors:
   - controller: usb0
-    zone: 1
+    zones: 1, 2
     entity_id: sensor.living_room_temperature
   - controller: usb1
-    zone: 3
+    zones: 3
     entity_id: sensor.office_temperature
 ```
 
 Notes:
 
 - `controller` must match the controller `name` in the add-on config.
-- `zone` is the numeric HMPD zone index.
+- `zones` is a comma-separated list of numeric HMPD zone indexes; the old single `zone` field still works.
 - `entity_id` must be an existing Home Assistant sensor entity.
 - When the external sensor is unavailable or invalid, the add-on falls back to the built-in HMPD temperature for that zone.
 - The add-on reads Home Assistant state through the internal Supervisor Core API proxy using `SUPERVISOR_TOKEN`.

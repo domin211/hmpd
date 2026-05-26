@@ -243,13 +243,21 @@ class HMPDBridge:
         self.ha_api_url = HOME_ASSISTANT_API_URL.rstrip("/")
         self.ha_sensor_timeout = HOME_ASSISTANT_SENSOR_TIMEOUT
         self.supervisor_token = os.getenv("SUPERVISOR_TOKEN", "")
-        self.external_temp_sensor_map = self.build_external_temp_sensor_map(
-            OPTIONS.get("external_temp_sensors", [])
+        self.external_temp_sensor_map = {}
+        self.booking_entity_map = {}
+        self.apply_room_config(OPTIONS.get("rooms", []))
+        self.external_temp_sensor_map.update(
+            self.build_external_temp_sensor_map(OPTIONS.get("external_temp_sensors", []))
         )
-        self.booking_entity_map = self.build_booking_entity_map(
-            OPTIONS.get("booking_status_entities", [])
+        self.booking_entity_map.update(
+            self.build_booking_entity_map(OPTIONS.get("booking_status_entities", []))
         )
         self.saved_booking_zone_state = self.load_saved_booking_zone_state()
+        self.shared_booking_on_temp, self.shared_booking_off_temp = self.load_shared_booking_temperatures()
+        self._shared_booking_on_temp_discovery_payload = None
+        self._shared_booking_off_temp_discovery_payload = None
+        self._shared_booking_on_temp_state_payload = None
+        self._shared_booking_off_temp_state_payload = None
         # Track which external sensors have warning issues - cleared periodically to avoid memory leak
         self.external_sensor_warnings_shown: Set[Tuple[str, int]] = set()
         self.last_external_sensor_warning_clear = time.monotonic()
@@ -350,6 +358,27 @@ class HMPDBridge:
             if not hasattr(zone, field_name):
                 setattr(zone, field_name, default_value)
 
+    def load_shared_booking_temperatures(self) -> Tuple[float, float]:
+        for raw_values in self.saved_booking_zone_state.values():
+            if not isinstance(raw_values, dict):
+                continue
+
+            raw_on = raw_values.get("on_temp")
+            raw_off = raw_values.get("off_temp")
+
+            try:
+                on_temp = self.snap_target(float(raw_on)) if raw_on is not None else self.booking_on_temp_default
+                off_temp = self.snap_target(float(raw_off)) if raw_off is not None else self.booking_off_temp_default
+                return on_temp, off_temp
+            except Exception:
+                continue
+
+        return self.booking_on_temp_default, self.booking_off_temp_default
+
+    def sync_booking_temperatures_to_zone(self, zone: Zone) -> None:
+        zone.booking_on_temp = self.shared_booking_on_temp
+        zone.booking_off_temp = self.shared_booking_off_temp
+
     def slugify(self, value: str) -> str:
         value = self.normalize_ascii(value).strip().lower()
         value = re.sub(r"[^a-z0-9]+", "_", value)
@@ -370,24 +399,108 @@ class HMPDBridge:
 
             controller_name = str(item.get("controller", "")).strip()
             entity_id = str(item.get("entity_id", "")).strip()
+            zones_raw = item.get("zones")
             zone_raw = item.get("zone")
 
-            if not controller_name or not entity_id or zone_raw in (None, ""):
+            if not controller_name or not entity_id or (zones_raw in (None, "") and zone_raw in (None, "")):
                 log.warning(
-                    "Ignoring external_temp_sensors entry with missing controller/zone/entity_id: %s",
+                    "Ignoring external_temp_sensors entry with missing controller/zones/entity_id: %s",
                     item,
                 )
                 continue
 
-            try:
-                zone_index = int(zone_raw)
-            except Exception:
-                log.warning("Ignoring external_temp_sensors entry with invalid zone %r: %s", zone_raw, item)
+            if isinstance(zones_raw, list):
+                zones_iterable = zones_raw
+            elif isinstance(zones_raw, str):
+                zones_iterable = [part.strip() for part in re.split(r"[;,\n]+", zones_raw) if part.strip()]
+            elif zone_raw not in (None, ""):
+                zones_iterable = [zone_raw]
+            else:
+                zones_iterable = []
+
+            if not zones_iterable:
+                log.warning("Ignoring external_temp_sensors entry with missing zones: %s", item)
                 continue
 
-            mapping[(controller_name, zone_index)] = entity_id
+            for zone_value in zones_iterable:
+                try:
+                    zone_index = int(zone_value)
+                except Exception:
+                    log.warning("Ignoring external_temp_sensors entry with invalid zone %r: %s", zone_value, item)
+                    continue
+
+                mapping[(controller_name, zone_index)] = entity_id
 
         return mapping
+
+    def apply_room_config(self, configured: List[dict]) -> None:
+        if not configured:
+            return
+
+        room_booking_entries: List[dict] = []
+        room_external_entries: List[dict] = []
+
+        for item in configured:
+            if not isinstance(item, dict):
+                continue
+
+            controller_name = str(item.get("controller", "")).strip()
+            calendar = str(item.get("calendar", "")).strip()
+            external_sensor = str(item.get("external_sensor", "")).strip()
+            external_enabled = bool(item.get("external_sensor_enabled", False))
+            room_name = str(item.get("name", "")).strip() or None
+            ids_raw = item.get("ids", [])
+
+            if not controller_name or not calendar or not ids_raw:
+                log.warning("Ignoring room entry with missing controller/calendar/ids: %s", item)
+                continue
+
+            if isinstance(ids_raw, list):
+                zone_ids = []
+                for zone in ids_raw:
+                    if str(zone).strip() == "":
+                        continue
+                    try:
+                        zone_ids.append(int(zone))
+                    except Exception:
+                        log.warning("Ignoring invalid room zone %r in %s", zone, item)
+            elif isinstance(ids_raw, str):
+                zone_ids = []
+                for part in re.split(r"[;,\n]+", ids_raw):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    try:
+                        zone_ids.append(int(part))
+                    except Exception:
+                        log.warning("Ignoring invalid room zone %r in %s", part, item)
+            else:
+                zone_ids = []
+
+            if not zone_ids:
+                log.warning("Ignoring room entry with no usable ids: %s", item)
+                continue
+
+            room_booking_entries.append(
+                {
+                    "name": room_name,
+                    "controller": controller_name,
+                    "entity_ids": [calendar],
+                    "zones": zone_ids,
+                }
+            )
+
+            if external_enabled and external_sensor:
+                room_external_entries.append(
+                    {
+                        "controller": controller_name,
+                        "zones": zone_ids,
+                        "entity_id": external_sensor,
+                    }
+                )
+
+        self.booking_entity_map.update(self.build_booking_entity_map(room_booking_entries))
+        self.external_temp_sensor_map.update(self.build_external_temp_sensor_map(room_external_entries))
 
     def get_external_sensor_entity_id(self, controller_name: str, zone_index: int) -> Optional[str]:
         entity_id = self.external_temp_sensor_map.get((controller_name, zone_index))
@@ -413,15 +526,12 @@ class HMPDBridge:
                 )
                 continue
 
-            # Handle entity_ids as list
+            # Accept either the old nested list form or the new comma-separated text field.
             entity_ids: List[str] = []
             if isinstance(entity_ids_raw, list):
                 entity_ids = [str(e).strip() for e in entity_ids_raw if str(e).strip()]
             elif isinstance(entity_ids_raw, str):
-                # Support single entity_id string for backward compatibility
-                entity_id = entity_ids_raw.strip()
-                if entity_id:
-                    entity_ids = [entity_id]
+                entity_ids = [part.strip() for part in re.split(r"[;,\n]+", entity_ids_raw) if part.strip()]
 
             if not entity_ids:
                 log.warning(
@@ -430,18 +540,22 @@ class HMPDBridge:
                 )
                 continue
 
-            # Handle zones as array of integers
-            if not isinstance(zones_raw, list):
-                zones_raw = []
+            # Accept either the old nested list form or the new comma-separated text field.
+            if isinstance(zones_raw, list):
+                zones_iterable = zones_raw
+            elif isinstance(zones_raw, str):
+                zones_iterable = [part.strip() for part in re.split(r"[;,\n]+", zones_raw) if part.strip()]
+            else:
+                zones_iterable = []
 
-            if not zones_raw:
+            if not zones_iterable:
                 log.warning(
                     "Ignoring booking_status_entities entry with missing zones: %s",
                     item,
                 )
                 continue
 
-            for zone_raw in zones_raw:
+            for zone_raw in zones_iterable:
                 try:
                     zone_index = int(zone_raw)
                 except Exception:
@@ -768,17 +882,17 @@ class HMPDBridge:
     def booking_state_command_topic(self, unique_id: str) -> str:
         return f"{self.base_topic}/{unique_id}/booking/state/set"
 
-    def booking_on_temp_state_topic(self, unique_id: str) -> str:
-        return f"{self.base_topic}/{unique_id}/booking/on_temp/state"
+    def shared_booking_on_temp_state_topic(self) -> str:
+        return f"{self.base_topic}/booking/on_temp/state"
 
-    def booking_on_temp_command_topic(self, unique_id: str) -> str:
-        return f"{self.base_topic}/{unique_id}/booking/on_temp/set"
+    def shared_booking_on_temp_command_topic(self) -> str:
+        return f"{self.base_topic}/booking/on_temp/set"
 
-    def booking_off_temp_state_topic(self, unique_id: str) -> str:
-        return f"{self.base_topic}/{unique_id}/booking/off_temp/state"
+    def shared_booking_off_temp_state_topic(self) -> str:
+        return f"{self.base_topic}/booking/off_temp/state"
 
-    def booking_off_temp_command_topic(self, unique_id: str) -> str:
-        return f"{self.base_topic}/{unique_id}/booking/off_temp/set"
+    def shared_booking_off_temp_command_topic(self) -> str:
+        return f"{self.base_topic}/booking/off_temp/set"
 
     def discovery_topic(self, unique_id: str) -> str:
         return f"{self.discovery_prefix}/climate/hmpd_{unique_id}/config"
@@ -802,12 +916,19 @@ class HMPDBridge:
             self.command_topic(unique_id),
             self.booking_state_topic(unique_id),
             self.booking_state_command_topic(unique_id),
-            self.booking_on_temp_state_topic(unique_id),
-            self.booking_on_temp_command_topic(unique_id),
-            self.booking_off_temp_state_topic(unique_id),
-            self.booking_off_temp_command_topic(unique_id),
         ]
         for topic in topics:
+            self.mqtt.publish(topic, "", qos=1, retain=True)
+
+    def cleanup_shared_booking_topics(self) -> None:
+        for topic in [
+            self.shared_booking_on_temp_state_topic(),
+            self.shared_booking_on_temp_command_topic(),
+            self.shared_booking_off_temp_state_topic(),
+            self.shared_booking_off_temp_command_topic(),
+            self.discovery_prefix + "/number/hmpd_booking_on_temp/config",
+            self.discovery_prefix + "/number/hmpd_booking_off_temp/config",
+        ]:
             self.mqtt.publish(topic, "", qos=1, retain=True)
 
     def zone_alias_candidates(self, controller: Controller, idx: int, name: str) -> Set[str]:
@@ -856,6 +977,7 @@ class HMPDBridge:
         return {c for c in candidates if c}
 
     def cleanup_all_retained_topics(self) -> None:
+        self.cleanup_shared_booking_topics()
         candidates: Set[str] = set()
         for controller in self.controllers:
             for idx in range(MAX_ZONE_INDEX):
@@ -1125,6 +1247,14 @@ class HMPDBridge:
                     payload,
                 )
                 return
+
+            shared_booking_match = re.match(
+                rf"^{re.escape(self.base_topic)}/booking/(on_temp|off_temp)/set$",
+                topic,
+            )
+            if shared_booking_match:
+                self.handle_shared_booking_temperature_command(shared_booking_match.group(1), payload)
+                return
         except Exception as exc:
             log.error("MQTT message handling failed for topic %s: %s", topic, exc)
 
@@ -1192,6 +1322,32 @@ class HMPDBridge:
         self.publish_booking_temperatures(zone)
         self.publish_state(zone)
         self.maybe_apply_booking_target(zone, f"{field_name}_update")
+
+    def handle_shared_booking_temperature_command(self, field_name: str, payload: str) -> None:
+        if not payload:
+            if DEBUG and not self.suppress_empty_command_logs:
+                log.debug("Ignoring empty shared booking payload for %s", field_name)
+            return
+
+        try:
+            value = float(payload)
+        except ValueError:
+            log.warning("Invalid shared booking %s payload: %s", field_name, payload)
+            return
+
+        snapped = self.snap_target(value)
+        if field_name == "on_temp":
+            self.shared_booking_on_temp = snapped
+        else:
+            self.shared_booking_off_temp = snapped
+
+        for zone in self.zones.values():
+            self.sync_booking_temperatures_to_zone(zone)
+            self.publish_state(zone)
+            self.maybe_apply_booking_target(zone, f"shared_{field_name}_update")
+
+        self.persist_booking_zone_state()
+        self.publish_booking_temperatures(None)
 
     def build_hmpd_cmd(self, controller: Controller, action_args: List[str]) -> List[str]:
         hmpd = self.ensure_hmpd()
@@ -1645,55 +1801,51 @@ class HMPDBridge:
         }
 
     def booking_on_temp_discovery_payload(self, zone: Zone) -> dict:
-        object_id = f"hmpd_{zone.unique_id}_booking_on_temp"
+        object_id = "hmpd_booking_on_temp"
         return {
-            "name": f"{zone.zone_name} Booking On Temp",
+            "name": "Booking On Temp",
             "object_id": object_id,
             "unique_id": object_id,
             "availability_topic": f"{self.base_topic}/bridge/status",
             "payload_available": "online",
             "payload_not_available": "offline",
-            "state_topic": self.booking_on_temp_state_topic(zone.unique_id),
-            "command_topic": self.booking_on_temp_command_topic(zone.unique_id),
+            "state_topic": self.shared_booking_on_temp_state_topic(),
+            "command_topic": self.shared_booking_on_temp_command_topic(),
             "min": self.temp_min,
             "max": self.temp_max,
             "step": self.temp_step,
             "mode": "box",
             "unit_of_measurement": "C",
             "device": {
-                "identifiers": [f"hmpd_{zone.unique_id}"],
-                "name": zone.zone_name,
+                "identifiers": ["hmpd_bridge"],
+                "name": "HMPD Bridge",
                 "manufacturer": "HMPD",
-                "model": "Thermostat Regulator",
-                "via_device": f"hmpd_bridge_{zone.controller_key}",
+                "model": "Thermostat Bridge",
             },
-            "suggested_area": zone.controller_name,
         }
 
     def booking_off_temp_discovery_payload(self, zone: Zone) -> dict:
-        object_id = f"hmpd_{zone.unique_id}_booking_off_temp"
+        object_id = "hmpd_booking_off_temp"
         return {
-            "name": f"{zone.zone_name} Booking Off Temp",
+            "name": "Booking Off Temp",
             "object_id": object_id,
             "unique_id": object_id,
             "availability_topic": f"{self.base_topic}/bridge/status",
             "payload_available": "online",
             "payload_not_available": "offline",
-            "state_topic": self.booking_off_temp_state_topic(zone.unique_id),
-            "command_topic": self.booking_off_temp_command_topic(zone.unique_id),
+            "state_topic": self.shared_booking_off_temp_state_topic(),
+            "command_topic": self.shared_booking_off_temp_command_topic(),
             "min": self.temp_min,
             "max": self.temp_max,
             "step": self.temp_step,
             "mode": "box",
             "unit_of_measurement": "C",
             "device": {
-                "identifiers": [f"hmpd_{zone.unique_id}"],
-                "name": zone.zone_name,
+                "identifiers": ["hmpd_bridge"],
+                "name": "HMPD Bridge",
                 "manufacturer": "HMPD",
-                "model": "Thermostat Regulator",
-                "via_device": f"hmpd_bridge_{zone.controller_key}",
+                "model": "Thermostat Bridge",
             },
-            "suggested_area": zone.controller_name,
         }
 
     def is_zone_off_mode(self, zone: Zone) -> bool:
@@ -1731,41 +1883,33 @@ class HMPDBridge:
             zone.last_booking_discovery_payload = booking_payload
             zone.booking_discovered = True
 
-        on_temp_payload = json.dumps(
+        shared_on_temp_payload = json.dumps(
             self.booking_on_temp_discovery_payload(zone),
             ensure_ascii=False,
             sort_keys=True,
         )
-        if not (
-            zone.booking_on_temp_discovered
-            and zone.last_booking_on_temp_discovery_payload == on_temp_payload
-        ):
+        if getattr(self, "_shared_booking_on_temp_discovery_payload", None) != shared_on_temp_payload:
             self.mqtt.publish(
-                self.booking_on_temp_discovery_topic(zone.unique_id),
-                on_temp_payload,
+                self.discovery_prefix + "/number/hmpd_booking_on_temp/config",
+                shared_on_temp_payload,
                 qos=1,
                 retain=self.retain_discovery,
             )
-            zone.last_booking_on_temp_discovery_payload = on_temp_payload
-            zone.booking_on_temp_discovered = True
+            self._shared_booking_on_temp_discovery_payload = shared_on_temp_payload
 
-        off_temp_payload = json.dumps(
+        shared_off_temp_payload = json.dumps(
             self.booking_off_temp_discovery_payload(zone),
             ensure_ascii=False,
             sort_keys=True,
         )
-        if not (
-            zone.booking_off_temp_discovered
-            and zone.last_booking_off_temp_discovery_payload == off_temp_payload
-        ):
+        if getattr(self, "_shared_booking_off_temp_discovery_payload", None) != shared_off_temp_payload:
             self.mqtt.publish(
-                self.booking_off_temp_discovery_topic(zone.unique_id),
-                off_temp_payload,
+                self.discovery_prefix + "/number/hmpd_booking_off_temp/config",
+                shared_off_temp_payload,
                 qos=1,
                 retain=self.retain_discovery,
             )
-            zone.last_booking_off_temp_discovery_payload = off_temp_payload
-            zone.booking_off_temp_discovered = True
+            self._shared_booking_off_temp_discovery_payload = shared_off_temp_payload
 
     def publish_state(self, zone: Zone) -> None:
         self.ensure_zone_runtime_fields(zone)
@@ -1814,20 +1958,19 @@ class HMPDBridge:
         self.mqtt.publish(topic, payload, qos=1, retain=self.retain_state)
         zone.last_booking_state_payload = payload
 
-    def publish_booking_temperatures(self, zone: Zone) -> None:
-        self.ensure_zone_runtime_fields(zone)
-        on_topic = self.booking_on_temp_state_topic(zone.unique_id)
-        off_topic = self.booking_off_temp_state_topic(zone.unique_id)
-        on_payload = f"{self.snap_target(zone.booking_on_temp):.1f}"
-        off_payload = f"{self.snap_target(zone.booking_off_temp):.1f}"
+    def publish_booking_temperatures(self, zone: Optional[Zone] = None) -> None:
+        if zone is not None:
+            self.ensure_zone_runtime_fields(zone)
+        on_payload = f"{self.snap_target(self.shared_booking_on_temp):.1f}"
+        off_payload = f"{self.snap_target(self.shared_booking_off_temp):.1f}"
 
-        if zone.last_booking_on_temp_payload != on_payload:
-            self.mqtt.publish(on_topic, on_payload, qos=1, retain=self.retain_state)
-            zone.last_booking_on_temp_payload = on_payload
+        if getattr(self, "_shared_booking_on_temp_state_payload", None) != on_payload:
+            self.mqtt.publish(self.shared_booking_on_temp_state_topic(), on_payload, qos=1, retain=self.retain_state)
+            self._shared_booking_on_temp_state_payload = on_payload
 
-        if zone.last_booking_off_temp_payload != off_payload:
-            self.mqtt.publish(off_topic, off_payload, qos=1, retain=self.retain_state)
-            zone.last_booking_off_temp_payload = off_payload
+        if getattr(self, "_shared_booking_off_temp_state_payload", None) != off_payload:
+            self.mqtt.publish(self.shared_booking_off_temp_state_topic(), off_payload, qos=1, retain=self.retain_state)
+            self._shared_booking_off_temp_state_payload = off_payload
 
     def remove_zone(self, unique_id: str) -> None:
         self.cleanup_unique_id(unique_id)
@@ -1910,8 +2053,8 @@ class HMPDBridge:
                     booking_entity_ids=booking_entity_ids,
                     booking_name=booking_name,
                     booking_state=saved_state,
-                    booking_on_temp=saved_on_temp,
-                    booking_off_temp=saved_off_temp,
+                    booking_on_temp=self.shared_booking_on_temp,
+                    booking_off_temp=self.shared_booking_off_temp,
                 )
                 self.zones[unique_id] = zone
                 created += 1
@@ -1926,8 +2069,7 @@ class HMPDBridge:
                 zone.enabled = data["enabled"]
                 zone.booking_entity_ids = booking_entity_ids
                 zone.booking_name = booking_name
-                zone.booking_on_temp = self.snap_target(zone.booking_on_temp)
-                zone.booking_off_temp = self.snap_target(zone.booking_off_temp)
+                self.sync_booking_temperatures_to_zone(zone)
                 updated += 1
 
             self.apply_external_sensor_temperature(zone)
