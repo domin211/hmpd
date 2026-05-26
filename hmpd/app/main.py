@@ -40,6 +40,33 @@ TARGET_SYNC_INTERVAL = 3600
 AUTO_OFFSET_COOLDOWN_SECONDS = 60
 EXTERNAL_SENSOR_TARGET_OFFSET = 2.0
 
+ROOM_DEFAULT_ZONE_IDS: Dict[str, List[int]] = {
+    "room_2": [18, 19],
+    "room_3": [20, 21],
+    "room_4": [22, 23],
+    "room_5": [24, 25],
+    "room_6": [0, 1],
+    "room_7": [2, 3],
+    "room_8": [4, 5],
+    "room_9": [6, 7],
+    "room_10": [16, 17],
+    "room_11": [18, 19],
+    "room_12": [24, 25],
+    "room_13": [26, 27],
+    "room_14": [20, 21, 22],
+    "room_15": [28, 29, 30],
+    "room_16": [32, 33],
+    "room_17": [34, 35],
+    "room_18": [36, 37],
+    "room_19": [38, 39],
+    "room_20": [48, 49],
+    "room_21": [50, 51],
+    "room_22": [56, 57],
+    "room_23": [58, 59],
+    "room_24": [52, 53],
+    "room_25": [60, 61],
+}
+
 TEMPS_TIMEOUT = 15
 REGS_TIMEOUT = 20
 SET_TIMEOUT = 20
@@ -473,9 +500,22 @@ class HMPDBridge:
             room_name = str(item.get("name", "")).strip() or None
             ids_raw = item.get("ids", [])
 
-            if not controller_name or not calendar or not ids_raw:
-                log.warning("Ignoring room entry with missing controller/calendar/ids: %s", item)
+            if not controller_name or not calendar:
+                log.warning("Ignoring room entry with missing controller/calendar: %s", item)
                 continue
+
+            if not ids_raw:
+                default_ids = ROOM_DEFAULT_ZONE_IDS.get(room_name or "")
+                if default_ids:
+                    ids_raw = default_ids
+                    log.info(
+                        "Room %s is using built-in zone ids %s",
+                        room_name or controller_name,
+                        default_ids,
+                    )
+                else:
+                    log.warning("Ignoring room entry with missing ids and no built-in default: %s", item)
+                    continue
 
             if isinstance(ids_raw, list):
                 zone_ids = []

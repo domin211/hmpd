@@ -61,7 +61,7 @@ Hardcoded values:
 - Sync intervals: 60s (current temp), 3600s (target), 60s (booking)
 - Temperature range: 16.0°C - 32.0°C with 1.0°C steps
 
-The `rooms` preset is the easiest setup path. Each room row expands into the booking and external temperature mappings the runtime already understands, so one UI item configures a whole room. Booking on/off temperatures are shared globally, so you only edit them once and every room uses the same values.
+The `rooms` preset is the easiest setup path. Each room row expands into the booking and external temperature mappings the runtime already understands, so one UI item configures a whole room. Booking on/off temperatures are shared globally, so you only edit them once and every room uses the same values. The zone ids for the built-in room preset are filled in by the add-on and do not need to be edited in the UI.
 
 ## Notes
 
@@ -81,13 +81,12 @@ rooms:
     calendar: calendar.pokoj_11
     external_sensor: sensor.pokoj_11_teplota
     external_sensor_enabled: true
-    ids: [18, 19]
 ```
 
 Each room row does three things:
 
 - maps the calendar to booking control
-- maps the room zone IDs to the correct controller
+- maps the room zone IDs to the correct controller using the built-in room preset
 - uses the external sensor as the current temperature source when `external_sensor_enabled` is `true`
 
 Legacy `booking_status_entities` and `external_temp_sensors` still work, but `rooms` is the recommended path.
