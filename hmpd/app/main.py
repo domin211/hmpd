@@ -258,6 +258,12 @@ class HMPDBridge:
         self._shared_booking_off_temp_discovery_payload = None
         self._shared_booking_on_temp_state_payload = None
         self._shared_booking_off_temp_state_payload = None
+        log.info(
+            "Loaded booking defaults: on=%.1f off=%.1f; room preset=%s entries",
+            self.shared_booking_on_temp,
+            self.shared_booking_off_temp,
+            len(OPTIONS.get("rooms", []) or []),
+        )
         # Track which external sensors have warning issues - cleared periodically to avoid memory leak
         self.external_sensor_warnings_shown: Set[Tuple[str, int]] = set()
         self.last_external_sensor_warning_clear = time.monotonic()
@@ -359,6 +365,7 @@ class HMPDBridge:
                 setattr(zone, field_name, default_value)
 
     def load_shared_booking_temperatures(self) -> Tuple[float, float]:
+        loaded_values: List[Tuple[float, float]] = []
         for raw_values in self.saved_booking_zone_state.values():
             if not isinstance(raw_values, dict):
                 continue
@@ -369,9 +376,16 @@ class HMPDBridge:
             try:
                 on_temp = self.snap_target(float(raw_on)) if raw_on is not None else self.booking_on_temp_default
                 off_temp = self.snap_target(float(raw_off)) if raw_off is not None else self.booking_off_temp_default
-                return on_temp, off_temp
+                if (on_temp, off_temp) not in loaded_values:
+                    loaded_values.append((on_temp, off_temp))
             except Exception:
                 continue
+
+        if len(loaded_values) > 1:
+            log.warning("Saved booking temperatures differ across zones; using the first readable pair")
+
+        if loaded_values:
+            return loaded_values[0]
 
         return self.booking_on_temp_default, self.booking_off_temp_default
 
@@ -429,6 +443,14 @@ class HMPDBridge:
                     log.warning("Ignoring external_temp_sensors entry with invalid zone %r: %s", zone_value, item)
                     continue
 
+                if (controller_name, zone_index) in mapping and mapping[(controller_name, zone_index)] != entity_id:
+                    log.warning(
+                        "Overwriting external sensor mapping for controller=%s zone=%s from %s to %s",
+                        controller_name,
+                        zone_index,
+                        mapping[(controller_name, zone_index)],
+                        entity_id,
+                    )
                 mapping[(controller_name, zone_index)] = entity_id
 
         return mapping
@@ -498,9 +520,19 @@ class HMPDBridge:
                         "entity_id": external_sensor,
                     }
                 )
+            elif external_enabled and not external_sensor:
+                log.warning(
+                    "Room %s has external_sensor_enabled=true but no external_sensor value",
+                    room_name or controller_name,
+                )
 
         self.booking_entity_map.update(self.build_booking_entity_map(room_booking_entries))
         self.external_temp_sensor_map.update(self.build_external_temp_sensor_map(room_external_entries))
+        log.info(
+            "Expanded room preset into %s booking mappings and %s external sensor mappings",
+            len(room_booking_entries),
+            len(room_external_entries),
+        )
 
     def get_external_sensor_entity_id(self, controller_name: str, zone_index: int) -> Optional[str]:
         entity_id = self.external_temp_sensor_map.get((controller_name, zone_index))
@@ -562,6 +594,14 @@ class HMPDBridge:
                     log.warning("Ignoring invalid zone %r in controller %s", zone_raw, controller_name)
                     continue
 
+                if (controller_name, zone_index) in mapping and mapping[(controller_name, zone_index)] != (name, entity_ids):
+                    log.warning(
+                        "Overwriting booking mapping for controller=%s zone=%s from %s to %s",
+                        controller_name,
+                        zone_index,
+                        mapping[(controller_name, zone_index)],
+                        (name, entity_ids),
+                    )
                 mapping[(controller_name, zone_index)] = (name, entity_ids)
                 if DEBUG:
                     log.debug(
@@ -930,6 +970,7 @@ class HMPDBridge:
             self.discovery_prefix + "/number/hmpd_booking_off_temp/config",
         ]:
             self.mqtt.publish(topic, "", qos=1, retain=True)
+        log.info("Cleared shared booking temperature retained topics")
 
     def zone_alias_candidates(self, controller: Controller, idx: int, name: str) -> Set[str]:
         base_name = name.strip()
@@ -1341,13 +1382,22 @@ class HMPDBridge:
         else:
             self.shared_booking_off_temp = snapped
 
+        updated_zones = 0
+
         for zone in self.zones.values():
             self.sync_booking_temperatures_to_zone(zone)
             self.publish_state(zone)
             self.maybe_apply_booking_target(zone, f"shared_{field_name}_update")
+            updated_zones += 1
 
         self.persist_booking_zone_state()
         self.publish_booking_temperatures(None)
+        log.info(
+            "Updated shared booking %s to %.1f and propagated to %s zones",
+            field_name,
+            snapped,
+            updated_zones,
+        )
 
     def build_hmpd_cmd(self, controller: Controller, action_args: List[str]) -> List[str]:
         hmpd = self.ensure_hmpd()
