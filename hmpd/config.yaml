@@ -1,6 +1,6 @@
 name: HMPD Thermostat Bridge
 slug: hmpd
-version: "3.0.10"
+version: "3.0.11"
 description: Expose HMPD thermostat zones to Home Assistant as MQTT climate entities
 arch:
   - amd64
@@ -33,6 +33,12 @@ options:
 
   # Room-based Configuration
   rooms:
+    - name: room_1
+      controller: usb1
+      calendar: calendar.pokoj_1
+      external_sensor: sensor.pokoj_1_teplota
+      external_sensor_enabled: true
+      ids: "16, 17"
     - name: room_2
       controller: usb1
       calendar: calendar.pokoj_2

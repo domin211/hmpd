@@ -92,10 +92,11 @@ Each room row does three things:
 - Home Assistant shows the external sensor as the current temperature.
 - Home Assistant keeps showing the user-requested target temperature.
 - External sensor target offset is fixed at `2.0`.
-- The add-on calculates an internal controller target from the difference between the built-in HMPD probe and the external HA sensor, then applies the configured offset directionally: `+offset` when room temperature is below target and `-offset` when room temperature is already at/above target.
+- The add-on calculates an internal controller target from the difference between the built-in HMPD probe and the external HA sensor, then applies the configured offset directionally with a `0.5`°C hysteresis band: `+offset` when room temperature is at least `0.5`°C below target and `-offset` when room temperature is at least `0.5`°C above target.
 - That internal controller target is re-synced through the existing queue system with a fixed cooldown of `60` seconds.
 - If the external sensor becomes unavailable, the add-on falls back to the built-in reading and stops applying offset corrections until the external value is usable again.
 - The built-in HMPD probe is also published as a separate `sensor` entity so you can graph internal and external temperatures side by side.
+- Only the first id in a room row uses the external sensor; any bathroom or WC ids in the same row stay on the built-in probe.
 
 
 ## Booking calendar mode (on/off)
@@ -132,6 +133,11 @@ This applies to manual target changes and booking-driven targets.
 ---
 
 ## Changelog
+
+### v3.0.11 - Offset Hysteresis Tune-Up (May 2026)
+
+- Added a 0.5°C hysteresis band to the external-sensor offset decision
+- Prevents tiny temperature jitter from flipping the offset direction around the setpoint
 
 ### v3.0.10 - Dual Temperature Graph Support (May 2026)
 

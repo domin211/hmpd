@@ -39,8 +39,10 @@ CURRENT_TEMP_SYNC_INTERVAL = 60
 TARGET_SYNC_INTERVAL = 3600
 AUTO_OFFSET_COOLDOWN_SECONDS = 60
 EXTERNAL_SENSOR_TARGET_OFFSET = 2.0
+EXTERNAL_SENSOR_HYSTERESIS_BAND = 0.5
 
 ROOM_DEFAULT_ZONE_IDS: Dict[str, List[int]] = {
+    "room_1": [16, 17],
     "room_2": [18, 19],
     "room_3": [20, 21],
     "room_4": [22, 23],
@@ -563,10 +565,12 @@ class HMPDBridge:
             )
 
             if external_enabled and external_sensor:
+                # Only map the external sensor to the primary (first) zone id for the room.
+                primary_zone = zone_ids[0]
                 room_external_entries.append(
                     {
                         "controller": controller_name,
-                        "zones": zone_ids,
+                        "zones": [primary_zone],
                         "entity_id": external_sensor,
                     }
                 )
@@ -886,9 +890,11 @@ class HMPDBridge:
     def external_sensor_directional_offset(self, requested_target: float, external_current: Optional[float]) -> float:
         if external_current is None:
             return 0.0
-        if external_current < requested_target:
+        if external_current <= (requested_target - EXTERNAL_SENSOR_HYSTERESIS_BAND):
             return self.external_sensor_target_offset
-        return -self.external_sensor_target_offset
+        if external_current >= (requested_target + EXTERNAL_SENSOR_HYSTERESIS_BAND):
+            return -self.external_sensor_target_offset
+        return 0.0
 
     def calculate_offset_adjusted_target(self, zone: Zone, requested_target: float) -> float:
         if requested_target <= OFF_MODE_TARGET_THRESHOLD:
