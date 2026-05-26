@@ -95,6 +95,7 @@ Each room row does three things:
 - The add-on calculates an internal controller target from the difference between the built-in HMPD probe and the external HA sensor, then applies the configured offset directionally: `+offset` when room temperature is below target and `-offset` when room temperature is already at/above target.
 - That internal controller target is re-synced through the existing queue system with a fixed cooldown of `60` seconds.
 - If the external sensor becomes unavailable, the add-on falls back to the built-in reading and stops applying offset corrections until the external value is usable again.
+- The built-in HMPD probe is also published as a separate `sensor` entity so you can graph internal and external temperatures side by side.
 
 
 ## Booking calendar mode (on/off)
@@ -132,11 +133,36 @@ This applies to manual target changes and booking-driven targets.
 
 ## Changelog
 
+### v3.0.10 - Dual Temperature Graph Support (May 2026)
+
+- Added separate MQTT sensors for internal and external room temperatures
+- Published both values so a Home Assistant history graph can show two temperature lines
+- Kept the existing climate entity behavior unchanged for control
+
 ### v3.0.9 - Room UI Cleanup Follow-up (May 2026)
 
 - Restored the room `ids` field as a comma-separated input so multiple zone IDs can be edited in one place
 - Added startup and runtime logs for room expansion, shared booking temperatures, and mapping conflicts
 - Kept booking temperatures shared globally so they can be edited once for all rooms
+
+### Example history graph
+
+Use the two new sensor entities in a Home Assistant history graph card. Replace the example entity ids with the discovered ones for your room:
+
+```yaml
+type: history-graph
+title: Room temperatures
+hours_to_show: 24
+entities:
+  - entity: sensor.hmpd_<room>_temperature_internal
+    name: Internal
+  - entity: sensor.hmpd_<room>_temperature_external
+    name: External
+  - entity: climate.<room>
+    name: Target
+```
+
+The climate entity still exposes a single current temperature for control; the two sensor entities are what you graph when you want internal and external temperatures together.
 
 ### v3.0.7 - Config/Docs Consistency Cleanup (April 2026)
 

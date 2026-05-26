@@ -835,18 +835,27 @@ class HMPDBridge:
 
         return value
 
+    def resolve_display_current_temp(self, zone: Zone) -> Optional[float]:
+        if zone.external_current_temp is not None:
+            return zone.external_current_temp
+        if zone.built_in_current_temp is not None:
+            return zone.built_in_current_temp
+        return zone.current_temp
+
     def apply_external_sensor_temperature(self, zone: Zone) -> bool:
         entity_id = zone.external_sensor_entity_id or self.get_external_sensor_entity_id(
             zone.controller_name, zone.zone_index
         )
         if not entity_id:
             zone.external_current_temp = None
+            zone.current_temp = self.resolve_display_current_temp(zone)
             return False
 
         zone.external_sensor_entity_id = entity_id
         external_temp = self.get_external_current_temp(entity_id)
         if external_temp is None:
             zone.external_current_temp = None
+            zone.current_temp = self.resolve_display_current_temp(zone)
             key = (zone.controller_name, zone.zone_index)
             if key not in self.external_sensor_warnings_shown:
                 log.warning(
@@ -861,7 +870,7 @@ class HMPDBridge:
         key = (zone.controller_name, zone.zone_index)
         self.external_sensor_warnings_shown.discard(key)
         zone.external_current_temp = external_temp
-        zone.current_temp = external_temp
+    zone.current_temp = self.resolve_display_current_temp(zone)
         
         # Periodically clear warnings set to prevent memory leak
         now = time.monotonic()
@@ -2108,7 +2117,9 @@ class HMPDBridge:
         self.ensure_zone_runtime_fields(zone)
         topic = self.state_topic(zone.unique_id)
 
-        current_temp = zone.current_temp if zone.current_temp is not None else self.temp_min
+        current_temp = self.resolve_display_current_temp(zone)
+        if current_temp is None:
+            current_temp = self.temp_min
         target_temp = zone.target_temp if zone.target_temp is not None else self.temp_min
         controller_target_temp = zone.controller_target_temp if zone.controller_target_temp is not None else target_temp
 
