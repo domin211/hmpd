@@ -59,7 +59,7 @@ Hardcoded values:
 - Sync intervals: 60s (current temp), 3600s (target), 60s (booking)
 - Temperature range: 16.0°C - 32.0°C with 1.0°C steps
 
-The `rooms` preset is the easiest setup path. Each room row expands into the booking and external temperature mappings the runtime already understands, so one UI item configures a whole room. Booking on/off temperatures are shared globally, so you only edit them once and every room uses the same values. The zone ids are now shown again in the UI so they can be reviewed or edited per room.
+The `rooms` preset is the easiest setup path. Each room row expands into the booking and external temperature mappings the runtime already understands, so one UI item configures a whole room. Booking on/off temperatures are shared globally, so you only edit them once and every room uses the same values. The zone ids are shown again in the UI as a comma-separated field so they can be reviewed or edited per room.
 
 ## Notes
 
@@ -132,9 +132,9 @@ This applies to manual target changes and booking-driven targets.
 
 ## Changelog
 
-### v3.0.8 - Room UI Cleanup (May 2026)
+### v3.0.9 - Room UI Cleanup Follow-up (May 2026)
 
-- Removed the manual `ids` field from the room UI and use built-in room zone defaults instead
+- Restored the room `ids` field as a comma-separated input so multiple zone IDs can be edited in one place
 - Added startup and runtime logs for room expansion, shared booking temperatures, and mapping conflicts
 - Kept booking temperatures shared globally so they can be edited once for all rooms
 

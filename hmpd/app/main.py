@@ -165,6 +165,7 @@ class Zone:
     unique_id: str
     current_temp: Optional[float] = None
     built_in_current_temp: Optional[float] = None
+    external_current_temp: Optional[float] = None
     controller_target_temp: Optional[float] = None
     target_temp: Optional[float] = None
     enabled: Optional[bool] = None
@@ -177,6 +178,10 @@ class Zone:
     discovered: bool = False
     last_discovery_payload: Optional[str] = None
     last_state_payload: Optional[str] = None
+    last_internal_temp_payload: Optional[str] = None
+    last_external_temp_payload: Optional[str] = None
+    last_internal_temp_discovery_payload: Optional[str] = None
+    last_external_temp_discovery_payload: Optional[str] = None
     last_booking_state_payload: Optional[str] = None
     last_booking_on_temp_payload: Optional[str] = None
     last_booking_off_temp_payload: Optional[str] = None
@@ -376,6 +381,10 @@ class HMPDBridge:
             "discovered": False,
             "last_discovery_payload": None,
             "last_state_payload": None,
+            "last_internal_temp_payload": None,
+            "last_external_temp_payload": None,
+            "last_internal_temp_discovery_payload": None,
+            "last_external_temp_discovery_payload": None,
             "last_booking_state_payload": None,
             "last_booking_on_temp_payload": None,
             "last_booking_off_temp_payload": None,
@@ -386,6 +395,7 @@ class HMPDBridge:
             "last_booking_on_temp_discovery_payload": None,
             "last_booking_off_temp_discovery_payload": None,
             "last_offset_adjust_at": 0.0,
+            "external_current_temp": None,
         }
         for field_name, default_value in defaults.items():
             if not hasattr(zone, field_name):
@@ -830,11 +840,13 @@ class HMPDBridge:
             zone.controller_name, zone.zone_index
         )
         if not entity_id:
+            zone.external_current_temp = None
             return False
 
         zone.external_sensor_entity_id = entity_id
         external_temp = self.get_external_current_temp(entity_id)
         if external_temp is None:
+            zone.external_current_temp = None
             key = (zone.controller_name, zone.zone_index)
             if key not in self.external_sensor_warnings_shown:
                 log.warning(
@@ -848,6 +860,7 @@ class HMPDBridge:
 
         key = (zone.controller_name, zone.zone_index)
         self.external_sensor_warnings_shown.discard(key)
+    zone.external_current_temp = external_temp
         zone.current_temp = external_temp
         
         # Periodically clear warnings set to prevent memory leak
@@ -953,6 +966,12 @@ class HMPDBridge:
     def state_topic(self, unique_id: str) -> str:
         return f"{self.base_topic}/{unique_id}/state"
 
+    def internal_temp_state_topic(self, unique_id: str) -> str:
+        return f"{self.base_topic}/{unique_id}/temperature/internal"
+
+    def external_temp_state_topic(self, unique_id: str) -> str:
+        return f"{self.base_topic}/{unique_id}/temperature/external"
+
     def command_topic(self, unique_id: str) -> str:
         return f"{self.base_topic}/{unique_id}/set_target"
 
@@ -977,6 +996,12 @@ class HMPDBridge:
     def discovery_topic(self, unique_id: str) -> str:
         return f"{self.discovery_prefix}/climate/hmpd_{unique_id}/config"
 
+    def internal_temp_discovery_topic(self, unique_id: str) -> str:
+        return f"{self.discovery_prefix}/sensor/hmpd_{unique_id}_temperature_internal/config"
+
+    def external_temp_discovery_topic(self, unique_id: str) -> str:
+        return f"{self.discovery_prefix}/sensor/hmpd_{unique_id}_temperature_external/config"
+
     def booking_discovery_topic(self, unique_id: str) -> str:
         return f"{self.discovery_prefix}/switch/hmpd_{unique_id}_booking/config"
 
@@ -989,10 +1014,14 @@ class HMPDBridge:
     def cleanup_unique_id(self, unique_id: str) -> None:
         topics = [
             self.discovery_topic(unique_id),
+            self.internal_temp_discovery_topic(unique_id),
+            self.external_temp_discovery_topic(unique_id),
             self.booking_discovery_topic(unique_id),
             self.booking_on_temp_discovery_topic(unique_id),
             self.booking_off_temp_discovery_topic(unique_id),
             self.state_topic(unique_id),
+            self.internal_temp_state_topic(unique_id),
+            self.external_temp_state_topic(unique_id),
             self.command_topic(unique_id),
             self.booking_state_topic(unique_id),
             self.booking_state_command_topic(unique_id),
@@ -1864,6 +1893,52 @@ class HMPDBridge:
             "suggested_area": zone.controller_name,
         }
 
+    def internal_temp_discovery_payload(self, zone: Zone) -> dict:
+        object_id = f"hmpd_{zone.unique_id}_temperature_internal"
+        return {
+            "name": f"{zone.zone_name} Internal Temperature",
+            "object_id": object_id,
+            "unique_id": object_id,
+            "availability_topic": f"{self.base_topic}/bridge/status",
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "state_topic": self.internal_temp_state_topic(zone.unique_id),
+            "device_class": "temperature",
+            "state_class": "measurement",
+            "unit_of_measurement": "C",
+            "device": {
+                "identifiers": [f"hmpd_{zone.unique_id}"],
+                "name": zone.zone_name,
+                "manufacturer": "HMPD",
+                "model": "Thermostat Regulator",
+                "via_device": f"hmpd_bridge_{zone.controller_key}",
+            },
+            "suggested_area": zone.controller_name,
+        }
+
+    def external_temp_discovery_payload(self, zone: Zone) -> dict:
+        object_id = f"hmpd_{zone.unique_id}_temperature_external"
+        return {
+            "name": f"{zone.zone_name} External Temperature",
+            "object_id": object_id,
+            "unique_id": object_id,
+            "availability_topic": f"{self.base_topic}/bridge/status",
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "state_topic": self.external_temp_state_topic(zone.unique_id),
+            "device_class": "temperature",
+            "state_class": "measurement",
+            "unit_of_measurement": "C",
+            "device": {
+                "identifiers": [f"hmpd_{zone.unique_id}"],
+                "name": zone.zone_name,
+                "manufacturer": "HMPD",
+                "model": "Thermostat Regulator",
+                "via_device": f"hmpd_bridge_{zone.controller_key}",
+            },
+            "suggested_area": zone.controller_name,
+        }
+
     def booking_discovery_payload(self, zone: Zone) -> dict:
         object_id = f"hmpd_{zone.unique_id}_booking"
         return {
@@ -1958,6 +2033,34 @@ class HMPDBridge:
             zone.last_discovery_payload = payload
             zone.discovered = True
 
+        internal_temp_payload = json.dumps(
+            self.internal_temp_discovery_payload(zone),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if zone.last_internal_temp_discovery_payload != internal_temp_payload:
+            self.mqtt.publish(
+                self.internal_temp_discovery_topic(zone.unique_id),
+                internal_temp_payload,
+                qos=1,
+                retain=self.retain_discovery,
+            )
+            zone.last_internal_temp_discovery_payload = internal_temp_payload
+
+        external_temp_payload = json.dumps(
+            self.external_temp_discovery_payload(zone),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if zone.last_external_temp_discovery_payload != external_temp_payload:
+            self.mqtt.publish(
+                self.external_temp_discovery_topic(zone.unique_id),
+                external_temp_payload,
+                qos=1,
+                retain=self.retain_discovery,
+            )
+            zone.last_external_temp_discovery_payload = external_temp_payload
+
         booking_payload = json.dumps(
             self.booking_discovery_payload(zone),
             ensure_ascii=False,
@@ -2037,6 +2140,8 @@ class HMPDBridge:
         self.mqtt.publish(topic, payload, qos=1, retain=self.retain_state)
         zone.last_state_payload = payload
 
+        self.publish_temperature_sensors(zone)
+
     def publish_booking_state(self, zone: Zone) -> None:
         self.ensure_zone_runtime_fields(zone)
         topic = self.booking_state_topic(zone.unique_id)
@@ -2061,6 +2166,38 @@ class HMPDBridge:
         if getattr(self, "_shared_booking_off_temp_state_payload", None) != off_payload:
             self.mqtt.publish(self.shared_booking_off_temp_state_topic(), off_payload, qos=1, retain=self.retain_state)
             self._shared_booking_off_temp_state_payload = off_payload
+
+    def publish_temperature_sensors(self, zone: Zone) -> None:
+        self.ensure_zone_runtime_fields(zone)
+
+        internal_value = zone.built_in_current_temp if zone.built_in_current_temp is not None else zone.current_temp
+        if internal_value is not None:
+            internal_payload = f"{internal_value:.1f}"
+            if zone.last_internal_temp_payload != internal_payload:
+                self.mqtt.publish(
+                    self.internal_temp_state_topic(zone.unique_id),
+                    internal_payload,
+                    qos=1,
+                    retain=self.retain_state,
+                )
+                zone.last_internal_temp_payload = internal_payload
+
+        external_value = zone.external_current_temp
+        if external_value is not None:
+            external_payload = f"{external_value:.1f}"
+        elif zone.external_sensor_entity_id:
+            external_payload = "unavailable"
+        else:
+            external_payload = "unavailable"
+
+        if zone.last_external_temp_payload != external_payload:
+            self.mqtt.publish(
+                self.external_temp_state_topic(zone.unique_id),
+                external_payload,
+                qos=1,
+                retain=self.retain_state,
+            )
+            zone.last_external_temp_payload = external_payload
 
     def remove_zone(self, unique_id: str) -> None:
         self.cleanup_unique_id(unique_id)
