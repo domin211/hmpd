@@ -249,7 +249,6 @@ class HMPDBridge:
         self.temp_min = TEMP_MIN
         self.temp_max = TEMP_MAX
         self.temp_step = TEMP_STEP
-        self.booking_sync_interval = BOOKING_SYNC_INTERVAL
         raw_booking_on = OPTIONS.get("booking_on_temp_default", BOOKING_ON_TEMP_DEFAULT)
         raw_booking_off = OPTIONS.get("booking_off_temp_default", BOOKING_OFF_TEMP_DEFAULT)
         try:
@@ -279,26 +278,13 @@ class HMPDBridge:
         self.supervisor_token = os.getenv("SUPERVISOR_TOKEN", "")
         self.external_temp_sensor_map = {}
         self.booking_entity_map = {}
-        self.apply_room_config(OPTIONS.get("rooms", []))
-        self.external_temp_sensor_map.update(
-            self.build_external_temp_sensor_map(OPTIONS.get("external_temp_sensors", []))
-        )
-        self.booking_entity_map.update(
-            self.build_booking_entity_map(OPTIONS.get("booking_status_entities", []))
-        )
-        self.saved_booking_zone_state = self.load_saved_booking_zone_state()
-        self.shared_booking_on_temp, self.shared_booking_off_temp = self.load_shared_booking_temperatures()
+        self.saved_booking_zone_state = {}
+        self.shared_booking_on_temp = self.booking_on_temp_default
+        self.shared_booking_off_temp = self.booking_off_temp_default
         self._shared_booking_on_temp_discovery_payload = None
         self._shared_booking_off_temp_discovery_payload = None
         self._shared_booking_on_temp_state_payload = None
         self._shared_booking_off_temp_state_payload = None
-        log.info(
-            "Loaded booking defaults: on=%.1f off=%.1f; room preset=%s entries",
-            self.shared_booking_on_temp,
-            self.shared_booking_off_temp,
-            len(OPTIONS.get("rooms", []) or []),
-        )
-        # Track which external sensors have warning issues - cleared periodically to avoid memory leak
         self.external_sensor_warnings_shown: Set[Tuple[str, int]] = set()
         self.last_external_sensor_warning_clear = time.monotonic()
 
@@ -349,7 +335,6 @@ class HMPDBridge:
         self.next_target_sync_at: Dict[str, float] = {
             controller.key: 0.0 for controller in self.controllers
         }
-        self.next_booking_sync_at = 0.0
 
         self.mqtt = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -1334,7 +1319,6 @@ class HMPDBridge:
             self.mqtt_connected = True
             log.info("Connected to MQTT broker %s:%s", self.mqtt_host, self.mqtt_port)
             client.subscribe(f"{self.base_topic}/+/set_target")
-            client.subscribe(f"{self.base_topic}/+/booking/+/set")
             client.subscribe(f"{self.base_topic}/bridge/resync")
         else:
             self.mqtt_connected = False
@@ -1359,26 +1343,6 @@ class HMPDBridge:
             target_match = re.match(rf"^{re.escape(self.base_topic)}/([^/]+)/set_target$", topic)
             if target_match:
                 self.handle_set_target_command(target_match.group(1), payload)
-                return
-
-            booking_match = re.match(
-                rf"^{re.escape(self.base_topic)}/([^/]+)/booking/(state|on_temp|off_temp)/set$",
-                topic,
-            )
-            if booking_match:
-                self.handle_booking_command(
-                    booking_match.group(1),
-                    booking_match.group(2),
-                    payload,
-                )
-                return
-
-            shared_booking_match = re.match(
-                rf"^{re.escape(self.base_topic)}/booking/(on_temp|off_temp)/set$",
-                topic,
-            )
-            if shared_booking_match:
-                self.handle_shared_booking_temperature_command(shared_booking_match.group(1), payload)
                 return
         except Exception as exc:
             log.error("MQTT message handling failed for topic %s: %s", topic, exc)
@@ -2048,77 +2012,6 @@ class HMPDBridge:
             zone.last_discovery_payload = payload
             zone.discovered = True
 
-        internal_temp_payload = json.dumps(
-            self.internal_temp_discovery_payload(zone),
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        if zone.last_internal_temp_discovery_payload != internal_temp_payload:
-            self.mqtt.publish(
-                self.internal_temp_discovery_topic(zone.unique_id),
-                internal_temp_payload,
-                qos=1,
-                retain=self.retain_discovery,
-            )
-            zone.last_internal_temp_discovery_payload = internal_temp_payload
-
-        external_temp_payload = json.dumps(
-            self.external_temp_discovery_payload(zone),
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        if zone.last_external_temp_discovery_payload != external_temp_payload:
-            self.mqtt.publish(
-                self.external_temp_discovery_topic(zone.unique_id),
-                external_temp_payload,
-                qos=1,
-                retain=self.retain_discovery,
-            )
-            zone.last_external_temp_discovery_payload = external_temp_payload
-
-        booking_payload = json.dumps(
-            self.booking_discovery_payload(zone),
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        if not (zone.booking_discovered and zone.last_booking_discovery_payload == booking_payload):
-            self.mqtt.publish(
-                self.booking_discovery_topic(zone.unique_id),
-                booking_payload,
-                qos=1,
-                retain=self.retain_discovery,
-            )
-            zone.last_booking_discovery_payload = booking_payload
-            zone.booking_discovered = True
-
-        shared_on_temp_payload = json.dumps(
-            self.booking_on_temp_discovery_payload(zone),
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        if getattr(self, "_shared_booking_on_temp_discovery_payload", None) != shared_on_temp_payload:
-            self.mqtt.publish(
-                self.discovery_prefix + "/number/hmpd_booking_on_temp/config",
-                shared_on_temp_payload,
-                qos=1,
-                retain=self.retain_discovery,
-            )
-            self._shared_booking_on_temp_discovery_payload = shared_on_temp_payload
-
-        shared_off_temp_payload = json.dumps(
-            self.booking_off_temp_discovery_payload(zone),
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        if getattr(self, "_shared_booking_off_temp_discovery_payload", None) != shared_off_temp_payload:
-            self.mqtt.publish(
-                self.discovery_prefix + "/number/hmpd_booking_off_temp/config",
-                shared_off_temp_payload,
-                qos=1,
-                retain=self.retain_discovery,
-            )
-            self._shared_booking_off_temp_discovery_payload = shared_off_temp_payload
-
     def publish_state(self, zone: Zone) -> None:
         self.ensure_zone_runtime_fields(zone)
         topic = self.state_topic(zone.unique_id)
@@ -2138,16 +2031,7 @@ class HMPDBridge:
             "current_temp": current_temp,
             "target_temp": target_temp,
             "mode": mode,
-            "booking_state": "on" if zone.booking_state else "off",
-            "booking_on_temp": zone.booking_on_temp,
-            "booking_off_temp": zone.booking_off_temp,
         }
-
-        if zone.external_sensor_entity_id:
-            payload_data["external_sensor_entity_id"] = zone.external_sensor_entity_id
-            payload_data["controller_target_temp"] = controller_target_temp
-            if zone.built_in_current_temp is not None:
-                payload_data["built_in_current_temp"] = zone.built_in_current_temp
 
         payload = json.dumps(payload_data, sort_keys=True)
 
@@ -2156,8 +2040,6 @@ class HMPDBridge:
 
         self.mqtt.publish(topic, payload, qos=1, retain=self.retain_state)
         zone.last_state_payload = payload
-
-        self.publish_temperature_sensors(zone)
 
     def publish_booking_state(self, zone: Zone) -> None:
         self.ensure_zone_runtime_fields(zone)
@@ -2234,10 +2116,8 @@ class HMPDBridge:
             if zone is not None:
                 zone.built_in_current_temp = current_temp
                 zone.current_temp = current_temp
-                self.apply_external_sensor_temperature(zone)
                 if zone.target_temp is None:
                     zone.target_temp = self.infer_display_target_from_controller_target(zone)
-                self.maybe_enqueue_offset_adjustment(zone, "temp_sync")
                 self.publish_state(zone)
                 updated += 1
 
@@ -2277,8 +2157,6 @@ class HMPDBridge:
             valid_unique_ids.add(unique_id)
             zone = self.zones.get(unique_id)
             seen_zone_names[name.casefold()] = seen_zone_names.get(name.casefold(), 0) + 1
-            booking_name, booking_entity_ids = self.get_booking_entity_info(controller.name, idx)
-            saved_on_temp, saved_off_temp, saved_state = self.get_saved_booking_values(unique_id)
 
             if zone is None:
                 zone = self.create_zone(
@@ -2293,12 +2171,6 @@ class HMPDBridge:
                     controller_target_temp=data["target_temp"],
                     target_temp=data["target_temp"],
                     enabled=data["enabled"],
-                    external_sensor_entity_id=self.get_external_sensor_entity_id(controller.name, idx),
-                    booking_entity_ids=booking_entity_ids,
-                    booking_name=booking_name,
-                    booking_state=saved_state,
-                    booking_on_temp=self.shared_booking_on_temp,
-                    booking_off_temp=self.shared_booking_off_temp,
                 )
                 self.zones[unique_id] = zone
                 created += 1
@@ -2308,25 +2180,16 @@ class HMPDBridge:
                 zone.built_in_current_temp = current_temp
                 if data["target_temp"] is not None:
                     zone.controller_target_temp = data["target_temp"]
-                    if zone.target_temp is None or not self.uses_external_sensor(zone):
+                    if zone.target_temp is None:
                         zone.target_temp = data["target_temp"]
                 zone.enabled = data["enabled"]
-                zone.booking_entity_ids = booking_entity_ids
-                zone.booking_name = booking_name
-                self.sync_booking_temperatures_to_zone(zone)
                 updated += 1
 
-            self.apply_external_sensor_temperature(zone)
             inferred_target = self.infer_display_target_from_controller_target(zone)
             if inferred_target is not None and zone.target_temp is None:
                 zone.target_temp = inferred_target
 
-            if zone.booking_entity_ids:
-                self.maybe_apply_booking_target(zone, "regs_sync")
-            self.maybe_enqueue_offset_adjustment(zone, "regs_sync")
             self.publish_discovery(zone)
-            self.publish_booking_state(zone)
-            self.publish_booking_temperatures(zone)
             self.publish_state(zone)
 
         stale_for_controller = [
@@ -2376,8 +2239,6 @@ class HMPDBridge:
         for controller in self.controllers:
             self.sync_regs_blocking(controller, "startup_initial_target_sync")
 
-        self.sync_booking_states_from_home_assistant()
-
     def scheduler_loop(self) -> None:
         last_health_check = time.monotonic()
         
@@ -2408,16 +2269,7 @@ class HMPDBridge:
                             )
 
                     if now >= self.next_target_sync_at[controller_key]:
-                        pending_sets = self.pending_set_count(controller_key)
-                        set_running = self.current_job_kind.get(controller_key) == "set"
-
-                        if pending_sets > 0 or set_running:
-                            if DEBUG:
-                                log.debug(
-                                    "Delaying target sync for %s because set command(s) are queued or running",
-                                    controller.name,
-                                )
-                        elif not self.is_job_kind_active_or_queued(controller_key, "regs"):
+                        if not self.is_job_kind_active_or_queued(controller_key, "regs"):
                             self.enqueue_controller_job(
                                 controller,
                                 ControllerJob(
@@ -2428,10 +2280,6 @@ class HMPDBridge:
                                 ),
                                 wait=False,
                             )
-
-                if now >= self.next_booking_sync_at:
-                    self.sync_booking_states_from_home_assistant()
-                    self.next_booking_sync_at = now + self.booking_sync_interval
 
                 time.sleep(1.0)
             except Exception as exc:
@@ -2496,7 +2344,6 @@ class HMPDBridge:
             for controller in self.controllers:
                 self.next_temp_sync_at[controller.key] = now + self.current_temp_sync_interval
                 self.next_target_sync_at[controller.key] = now + self.target_sync_interval
-            self.next_booking_sync_at = now + self.booking_sync_interval
 
             self.scheduler_loop()
         except Exception as exc:
