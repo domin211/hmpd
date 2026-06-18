@@ -1337,7 +1337,7 @@ class HMPDBridge:
 
         try:
             if topic == f"{self.base_topic}/bridge/resync":
-                self.force_full_republish()
+                threading.Thread(target=self.force_full_republish, daemon=True).start()
                 return
 
             target_match = re.match(rf"^{re.escape(self.base_topic)}/([^/]+)/set_target$", topic)
@@ -1884,7 +1884,7 @@ class HMPDBridge:
             "state_topic": self.internal_temp_state_topic(zone.unique_id),
             "device_class": "temperature",
             "state_class": "measurement",
-            "unit_of_measurement": "C",
+            "unit_of_measurement": "°C",
             "device": {
                 "identifiers": [f"hmpd_{zone.unique_id}"],
                 "name": zone.zone_name,
@@ -1907,7 +1907,7 @@ class HMPDBridge:
             "state_topic": self.external_temp_state_topic(zone.unique_id),
             "device_class": "temperature",
             "state_class": "measurement",
-            "unit_of_measurement": "C",
+            "unit_of_measurement": "°C",
             "device": {
                 "identifiers": [f"hmpd_{zone.unique_id}"],
                 "name": zone.zone_name,
@@ -1944,7 +1944,7 @@ class HMPDBridge:
             "suggested_area": zone.controller_name,
         }
 
-    def booking_on_temp_discovery_payload(self, zone: Zone) -> dict:
+    def booking_on_temp_discovery_payload(self, _zone: Zone) -> dict:
         object_id = "hmpd_booking_on_temp"
         return {
             "name": "Booking On Temp",
@@ -1959,7 +1959,7 @@ class HMPDBridge:
             "max": self.temp_max,
             "step": self.temp_step,
             "mode": "box",
-            "unit_of_measurement": "C",
+            "unit_of_measurement": "°C",
             "device": {
                 "identifiers": ["hmpd_bridge"],
                 "name": "HMPD Bridge",
@@ -1968,7 +1968,7 @@ class HMPDBridge:
             },
         }
 
-    def booking_off_temp_discovery_payload(self, zone: Zone) -> dict:
+    def booking_off_temp_discovery_payload(self, _zone: Zone) -> dict:
         object_id = "hmpd_booking_off_temp"
         return {
             "name": "Booking Off Temp",
@@ -1983,7 +1983,7 @@ class HMPDBridge:
             "max": self.temp_max,
             "step": self.temp_step,
             "mode": "box",
-            "unit_of_measurement": "C",
+            "unit_of_measurement": "°C",
             "device": {
                 "identifiers": ["hmpd_bridge"],
                 "name": "HMPD Bridge",
@@ -2005,9 +2005,7 @@ class HMPDBridge:
         self.ensure_zone_runtime_fields(zone)
         topic = self.discovery_topic(zone.unique_id)
         payload = json.dumps(self.discovery_payload(zone), ensure_ascii=False, sort_keys=True)
-        if zone.last_discovery_payload == payload and zone.discovered:
-            pass
-        else:
+        if not (zone.last_discovery_payload == payload and zone.discovered):
             self.mqtt.publish(topic, payload, qos=1, retain=self.retain_discovery)
             zone.last_discovery_payload = payload
             zone.discovered = True
@@ -2084,8 +2082,6 @@ class HMPDBridge:
         external_value = zone.external_current_temp
         if external_value is not None:
             external_payload = f"{external_value:.1f}"
-        elif zone.external_sensor_entity_id:
-            external_payload = "unavailable"
         else:
             external_payload = "unavailable"
 
