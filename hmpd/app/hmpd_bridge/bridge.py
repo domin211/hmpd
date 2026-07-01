@@ -174,6 +174,7 @@ class HMPDBridge:
 
         created = updated = skipped_no_temp = 0
         valid_unique_ids: set[str] = set()
+        skipped_zones: list[str] = []
 
         for idx, data in parsed.items():
             name = (data["name"] or "").strip()
@@ -183,6 +184,7 @@ class HMPDBridge:
             current_temp = temps.get(idx, data.get("current_temp"))
             if current_temp is None:
                 skipped_no_temp += 1
+                skipped_zones.append(f"{idx}:{name}")
                 continue
 
             unique_id = zone_unique_id(controller.key, idx)
@@ -235,6 +237,14 @@ class HMPDBridge:
             updated,
             skipped_no_temp,
         )
+        if skipped_zones:
+            log.warning(
+                "Controller %s has %s named zone(s) with no valid current temperature (no reading "
+                "from temps or regs cur:): %s",
+                controller.name,
+                len(skipped_zones),
+                ", ".join(skipped_zones),
+            )
 
     def _remove_zone(self, unique_id: str) -> None:
         for topic in (self.topics.discovery(unique_id), self.topics.state(unique_id), self.topics.command(unique_id)):
