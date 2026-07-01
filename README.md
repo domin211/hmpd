@@ -3,19 +3,12 @@
 This repository contains a Home Assistant add-on that exposes HMPD thermostat zones
 to Home Assistant through MQTT discovery.
 
-## v4.0.0 — Rewrite
+## v4.1.0 — Rewrite + diagnostics
 
 The add-on was rewritten from a single 2,400-line script into a small, tested
 `hmpd_bridge` package. Behavior is unchanged: the MQTT topics, discovery payloads,
 temperature range/step, and the `hmpd` binary invocation are identical to before.
-
-The rewrite also removed a large amount of dead code left over from the v3.0.12
-"minimal export" release: booking/calendar sync, external-sensor offsetting, and the
-Home Assistant Supervisor API client were never actually wired up to anything (no
-MQTT subscription routed to them, and their config options had already been removed
-from `config.yaml`), so none of it ever ran. It has now been deleted along with the
-per-restart legacy-topic migration sweep, which was one-time tooling for the v3.0.12
-transition and has already served its purpose.
+See the [Changelog](#changelog) below for the full list of what changed.
 
 ## Install
 
@@ -46,6 +39,42 @@ Hardcoded stability choices:
 - Users set temperature via the climate entity; the add-on issues HMPD `set` commands to the controller.
 - Publishing `bridge/resync` on the base MQTT topic forces a full re-sync (clears cached
   zones and re-polls `temps`/`regs` on every controller).
+
+## Changelog
+
+### v4.1.0 - Diagnostics (Jul 2026)
+- Restored per-register debug logging (dropped during the v4.0.0 rewrite) that shows
+  why a named zone has no valid current-temperature reading
+- Added a warning that lists the specific zone `index:name` pairs missing a reading,
+  not just a count
+- Added a log of the complete raw `temps`/`regs` output per controller at INFO level,
+  so the exact controller response is always visible without digging through debug noise
+
+### v4.0.0 - Rewrite (Jul 2026)
+- Replaced the single 2,400-line `main.py` with a small, tested `hmpd_bridge` package
+  (`config`/`models`/`topics`/`hmpd_cli`/`queue`/`bridge` modules)
+- Removed ~900 lines of dead code left over from the v3.0.12 "minimal export" release:
+  booking/calendar sync, external-sensor offsetting, and the Home Assistant Supervisor
+  API client were never wired to any MQTT subscription or scheduler call, so none of it
+  ever ran
+- Removed the per-restart legacy-topic migration sweep (one-time v3.0.12 transition
+  tooling that had already served its purpose)
+- Removed the now-unused `homeassistant_api: true` permission
+- Bumped the Alpine base image from 3.20 (past end-of-support) to 3.24
+- Fixed CRLF line endings that broke `/app/run.sh` inside the container; added
+  `.gitattributes` so a Windows checkout can't reintroduce this
+- Added pytest unit tests (31), ruff/mypy config, GitHub Actions CI, and Dependabot
+- MQTT topic names, discovery payload shape, and the `hmpd` binary CLI contract are
+  unchanged from pre-rewrite behavior
+
+### v3.0.12 - Minimal Thermostat Export (Jun 2026)
+- Removed calendar/booking and external-sensor syncing from the exposed config options
+  (the underlying code wasn't actually deleted until v4.0.0 — see above)
+- Clean up legacy retained booking/external topics on startup
+
+### v3.0.11 - Offset Hysteresis Tune-Up (May 2026)
+- Added a 0.5°C hysteresis band to the external-sensor offset decision (this logic was
+  dead code, never reachable at runtime, and was removed in v4.0.0)
 
 ## Code layout
 
