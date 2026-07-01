@@ -106,6 +106,15 @@ class HMPDBridge:
             cmd = hmpd_cli.build_hmpd_cmd(self._ensure_hmpd(), controller, job.action_args)
             lines = hmpd_cli.run_hmpd(cmd, job.timeout)
 
+            if job.kind in ("temps", "regs"):
+                log.info(
+                    "RAW %s output for %s (%s lines):\n%s",
+                    job.kind,
+                    controller.name,
+                    len(lines),
+                    "\n".join(lines),
+                )
+
             if job.kind == "temps":
                 self._validate_temps(controller, lines)
                 self._apply_temps(controller, lines)
