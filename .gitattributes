@@ -1,0 +1,8 @@
+# Force LF line endings for text files regardless of the checkout platform.
+# Without this, Git for Windows' common `core.autocrlf=true` default silently
+# converts run.sh (and anything else) to CRLF on checkout, which breaks the
+# shebang inside the container ("exec /app/run.sh: no such file or directory").
+* text=auto eol=lf
+
+# The hmpd controller binary must never go through text/EOL normalization.
+hmpd/hmpd/hmpd binary

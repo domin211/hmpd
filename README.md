@@ -1,16 +1,21 @@
 # HMPD Home Assistant Add-on
 
-This repository contains a Home Assistant add-on that exposes HMPD thermostat zones to Home Assistant through MQTT discovery.
+This repository contains a Home Assistant add-on that exposes HMPD thermostat zones
+to Home Assistant through MQTT discovery.
 
-## v3.0.12 — Minimal Thermostat Export
+## v4.0.0 — Rewrite
 
-This release trims advanced features and focuses on a single responsibility: reliably exporting HMPD thermostats as MQTT-discovered Home Assistant `climate` entities.
+The add-on was rewritten from a single 2,400-line script into a small, tested
+`hmpd_bridge` package. Behavior is unchanged: the MQTT topics, discovery payloads,
+temperature range/step, and the `hmpd` binary invocation are identical to before.
 
-Removed features:
-- Calendar/booking sync and booking-related MQTT entities
-- External-sensor offsetting and external temperature sensor discovery
-
-The add-on still includes startup cleanup logic to remove legacy retained discovery/state topics for removed entities so old retained topics don't linger in MQTT.
+The rewrite also removed a large amount of dead code left over from the v3.0.12
+"minimal export" release: booking/calendar sync, external-sensor offsetting, and the
+Home Assistant Supervisor API client were never actually wired up to anything (no
+MQTT subscription routed to them, and their config options had already been removed
+from `config.yaml`), so none of it ever ran. It has now been deleted along with the
+per-restart legacy-topic migration sweep, which was one-time tooling for the v3.0.12
+transition and has already served its purpose.
 
 ## Install
 
@@ -39,25 +44,38 @@ Hardcoded stability choices:
 - The add-on publishes Home Assistant MQTT discovery `climate` entities for each HMPD zone.
 - State payloads include `current_temp`, `target_temp`, and `mode` only.
 - Users set temperature via the climate entity; the add-on issues HMPD `set` commands to the controller.
-- Legacy retained topics for booking/external sensors are cleaned at startup.
+- Publishing `bridge/resync` on the base MQTT topic forces a full re-sync (clears cached
+  zones and re-polls `temps`/`regs` on every controller).
 
-## Deployment Checklist
+## Code layout
 
-- Syntax validated: `python3 -m py_compile hmpd/app/main.py`
-- Add-on metadata version bumped to `3.0.12`
-- README updated to describe current behavior
+```
+hmpd/app/
+  main.py            # entrypoint: logging setup, load options, run the bridge
+  hmpd_bridge/
+    config.py         # options.json loading, Controller/TempRange
+    models.py          # Zone / ControllerJob
+    topics.py          # MQTT topic names + discovery/state payloads
+    hmpd_cli.py        # locate + invoke the hmpd binary, parse its output
+    queue.py            # per-controller job queue, retry/backoff
+    bridge.py            # MQTT wiring, sync scheduler, zone state
+  tests/                 # pytest unit tests for everything above
+```
 
-## Changelog
+## Development
 
-### v3.0.12 - Minimal Thermostat Export (Jun 2026)
-- Removed calendar/booking and external-sensor syncing — export thermostats only
-- Clean up legacy retained booking/external topics on startup
-- Bumped add-on metadata version for release
+```
+cd hmpd/app
+pip install -r requirements-dev.txt
+ruff check .
+mypy
+pytest
+```
 
-### v3.0.11 - Offset Hysteresis Tune-Up (May 2026)
-- Added a 0.5°C hysteresis band to the external-sensor offset decision
-- Prevents tiny temperature jitter from flipping the offset direction around the setpoint
-
+None of the above can exercise the real serial hardware or a live MQTT broker — those
+are integration-tested by running the add-on for real. After any change, watch the
+add-on log (`debug: true` → `/config/hmpd_bridge.log`) through one full sync cycle
+before trusting it.
 
 ## Support
 

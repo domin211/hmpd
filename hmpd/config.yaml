@@ -1,6 +1,6 @@
 name: HMPD Thermostat Bridge
 slug: hmpd
-version: "3.0.12"
+version: "4.0.0"
 description: Expose HMPD thermostat zones to Home Assistant as MQTT climate entities
 arch:
   - amd64
@@ -10,7 +10,6 @@ startup: services
 boot: auto
 init: false
 uart: true
-homeassistant_api: true
 
 map:
   - type: homeassistant_config
