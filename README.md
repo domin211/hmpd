@@ -42,6 +42,14 @@ Hardcoded stability choices:
 
 ## Changelog
 
+### v4.1.1 - Revert Alpine base image (Jul 2026)
+- Reverted the Alpine base image from 3.24 back to 3.20. The `hmpd` binary is
+  glibc-linked and runs on Alpine through a compatibility shim
+  (`libc6-compat`/`gcompat`); the 3.24 bump is suspected of shifting timing for the
+  binary's serial-bus polling thread, causing previously-reliable zones (several
+  real rooms plus pool/sauna/kitchen/etc.) to intermittently return garbage
+  current-temperature readings. Reverting until this is confirmed/ruled out.
+
 ### v4.1.0 - Diagnostics (Jul 2026)
 - Restored per-register debug logging (dropped during the v4.0.0 rewrite) that shows
   why a named zone has no valid current-temperature reading
