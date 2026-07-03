@@ -7,10 +7,10 @@ from hmpd_bridge import hmpd_cli
 from hmpd_bridge.config import TempRange
 
 
-def test_parse_temps_skips_out_of_range_and_malformed_lines():
-    lines = ["0: 21.4", "1: 19.9", "not-a-line", "2: 500.0", "3: -60.0"]
-    parsed = hmpd_cli.parse_temps(lines, TempRange())
-    assert parsed == {0: 21.4, 1: 19.9}
+def test_parse_temps_skips_only_malformed_lines():
+    lines = ["0: 21.4", "1: 19.9", "not-a-line", "2: 3027.1", "3: -60.0"]
+    parsed = hmpd_cli.parse_temps(lines)
+    assert parsed == {0: 21.4, 1: 19.9, 2: 3027.1, 3: -60.0}
 
 
 def test_parse_regs_extracts_fields_and_enabled_flag():
@@ -27,10 +27,10 @@ def test_parse_regs_extracts_fields_and_enabled_flag():
     assert 2 not in parsed
 
 
-def test_parse_regs_snaps_target_and_ignores_bad_current_temp():
-    lines = ["0 | Room | cur: 500.0 | tgt: 22.4 | EN"]
+def test_parse_regs_snaps_target_and_passes_through_current_temp_unfiltered():
+    lines = ["0 | Room | cur: 3027.1 | tgt: 22.4 | EN"]
     parsed = hmpd_cli.parse_regs(lines, TempRange())
-    assert parsed[0]["current_temp"] is None
+    assert parsed[0]["current_temp"] == 3027.1
     assert parsed[0]["target_temp"] == 22.0
 
 

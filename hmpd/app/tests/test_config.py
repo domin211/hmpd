@@ -24,13 +24,6 @@ def test_temp_range_clamps_out_of_bounds():
     assert temp_range.snap(100.0) == 32.0
 
 
-def test_temp_range_valid_current_temp_bounds():
-    temp_range = TempRange()
-    assert temp_range.valid_current_temp(21.0) is True
-    assert temp_range.valid_current_temp(-40.0) is False
-    assert temp_range.valid_current_temp(200.0) is False
-
-
 def test_build_options_defaults_when_empty():
     options = build_options({})
     assert options.debug is False

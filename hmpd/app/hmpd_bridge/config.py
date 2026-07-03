@@ -44,9 +44,6 @@ TEMP_MAX = 32.0
 TEMP_STEP = 1.0
 OFF_MODE_TARGET_THRESHOLD = 18.0
 
-CURRENT_TEMP_MIN = 5.0
-CURRENT_TEMP_MAX = 50.0
-
 RETAIN_DISCOVERY = True
 RETAIN_STATE = True
 
@@ -68,9 +65,6 @@ class TempRange:
         steps = round((clamped - self.minimum) / self.step)
         snapped = self.minimum + steps * self.step
         return round(max(self.minimum, min(self.maximum, snapped)), 1)
-
-    def valid_current_temp(self, value: float) -> bool:
-        return CURRENT_TEMP_MIN < value < CURRENT_TEMP_MAX
 
 
 @dataclass(frozen=True)

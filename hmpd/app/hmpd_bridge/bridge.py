@@ -131,7 +131,7 @@ class HMPDBridge:
         return execute
 
     def _validate_temps(self, controller: Controller, lines: list[str]) -> None:
-        if not hmpd_cli.parse_temps(lines, self.temp_range):
+        if not hmpd_cli.parse_temps(lines):
             raise RuntimeError(f"No valid temps returned for controller {controller.name}")
 
     def _validate_regs(self, controller: Controller, lines: list[str]) -> None:
@@ -163,7 +163,7 @@ class HMPDBridge:
     # -- syncing zone state from parsed output -----------------------------
 
     def _apply_temps(self, controller: Controller, lines: list[str]) -> None:
-        temps = hmpd_cli.parse_temps(lines, self.temp_range)
+        temps = hmpd_cli.parse_temps(lines)
         self.latest_temps[controller.key] = temps
 
         for idx, current_temp in temps.items():
@@ -181,13 +181,17 @@ class HMPDBridge:
         parsed = hmpd_cli.parse_regs(lines, self.temp_range)
         temps = self.latest_temps.get(controller.key, {})
 
-        created = updated = skipped_no_temp = 0
+        created = updated = skipped_no_temp = skipped_disabled = 0
         valid_unique_ids: set[str] = set()
         skipped_zones: list[str] = []
 
         for idx, data in parsed.items():
             name = (data["name"] or "").strip()
             if not name:
+                continue
+
+            if not data["enabled"]:
+                skipped_disabled += 1
                 continue
 
             current_temp = temps.get(idx, data.get("current_temp"))
@@ -240,16 +244,17 @@ class HMPDBridge:
             self._remove_zone(unique_id)
 
         log.info(
-            "Synced regs for %s (%s created, %s updated, %s skipped_no_temp)",
+            "Synced regs for %s (%s created, %s updated, %s skipped_no_temp, %s skipped_disabled)",
             controller.name,
             created,
             updated,
             skipped_no_temp,
+            skipped_disabled,
         )
         if skipped_zones:
             log.warning(
-                "Controller %s has %s named zone(s) with no valid current temperature (no reading "
-                "from temps or regs cur:): %s",
+                "Controller %s has %s enabled named zone(s) with no current temperature reading at "
+                "all (missing from both temps and regs cur:): %s",
                 controller.name,
                 len(skipped_zones),
                 ", ".join(skipped_zones),

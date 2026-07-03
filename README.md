@@ -34,13 +34,28 @@ Hardcoded stability choices:
 
 ## Behavior
 
-- The add-on publishes Home Assistant MQTT discovery `climate` entities for each HMPD zone.
-- State payloads include `current_temp`, `target_temp`, and `mode` only.
+- The add-on publishes Home Assistant MQTT discovery `climate` entities for each HMPD
+  zone the controller reports as `EN` (enabled) in its `regs` output. `DIS` (disabled)
+  zones are never created, regardless of what their current-temperature reading looks
+  like; a zone that flips to `DIS` is removed on the next sync.
+- State payloads include `current_temp`, `target_temp`, and `mode` only. `current_temp`
+  is passed through as reported by the controller, unfiltered -- if a sensor is
+  faulty and reports a nonsensical value, that's what you'll see in Home Assistant.
 - Users set temperature via the climate entity; the add-on issues HMPD `set` commands to the controller.
 - Publishing `bridge/resync` on the base MQTT topic forces a full re-sync (clears cached
   zones and re-polls `temps`/`regs` on every controller).
 
 ## Changelog
+
+### v4.2.0 - Enabled/disabled is the only zone filter (Jul 2026)
+- Removed the 5-50°C sanity-range filter on current-temperature readings. A zone's
+  `cur:` value is now passed straight through to Home Assistant as-is, even if it
+  looks nonsensical (e.g. a sensor reporting 3000+, which usually means a
+  wiring/communication fault) -- the only thing that decides whether a zone shows up
+  is the controller's own `EN`/`DIS` (enabled/disabled) flag from the `regs` output
+  now, not whether the current temperature looks sane
+- A zone that flips from `EN` to `DIS` between syncs is now removed from Home
+  Assistant on the next `regs` sync, same as any other stale zone
 
 ### v4.1.1 - Revert Alpine base image (Jul 2026)
 - Reverted the Alpine base image from 3.24 back to 3.20. The `hmpd` binary is

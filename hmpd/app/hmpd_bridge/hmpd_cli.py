@@ -110,20 +110,17 @@ def run_hmpd(cmd: list[str], timeout: int) -> list[str]:
     return lines
 
 
-def parse_temps(lines: list[str], temp_range: TempRange) -> dict[int, float]:
+def parse_temps(lines: list[str]) -> dict[int, float]:
     parsed: dict[int, float] = {}
     for line in lines:
         try:
             idx_str, val_str = line.split(":", 1)
             idx = int(idx_str.strip())
             val = float(val_str.strip())
-            if not temp_range.valid_current_temp(val):
-                log.debug("TEMP idx=%s out of valid range (%.1f) | raw=%s", idx, val, line)
-                continue
             parsed[idx] = round(val, 1)
         except (ValueError, IndexError) as exc:
             log.error("TEMP parse error: %s | raw=%s", exc, line)
-    log.debug("Parsed %s valid temps from %s lines", len(parsed), len(lines))
+    log.debug("Parsed %s temps from %s lines", len(parsed), len(lines))
     return parsed
 
 
@@ -147,11 +144,7 @@ def parse_regs(lines: list[str], temp_range: TempRange) -> dict[int, dict]:
             current_temp: float | None = None
             m_cur = _REG_CUR_RE.search(parts[2])
             if m_cur:
-                raw_cur = float(m_cur.group(1))
-                if temp_range.valid_current_temp(raw_cur):
-                    current_temp = round(raw_cur, 1)
-                else:
-                    log.debug("REG idx=%s name=%s cur out of valid range (%.1f) | raw=%s", idx, name, raw_cur, line)
+                current_temp = round(float(m_cur.group(1)), 1)
             else:
                 log.debug("REG idx=%s name=%s has no cur: field | raw=%s", idx, name, line)
 

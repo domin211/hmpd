@@ -93,3 +93,27 @@ def test_off_mode_reflected_in_state_payload():
 
     zone_b = bridge.zones[f"{controller.key}_1"]  # target_temp 18.0 <= off threshold
     assert zone_b.is_off_mode(18.0) is True
+
+
+def test_apply_regs_never_creates_disabled_zones_even_with_valid_temp():
+    bridge = make_bridge()
+    controller = bridge.controllers[0]
+
+    lines = REGS_LINES + ["2 | Unused Slot | cur: 21.0 | tgt: 18.0 | DIS"]
+    bridge._apply_regs(controller, lines)
+
+    assert f"{controller.key}_2" not in bridge.zones
+    assert set(bridge.zones.keys()) == {f"{controller.key}_0", f"{controller.key}_1"}
+
+
+def test_apply_regs_removes_zone_that_becomes_disabled():
+    bridge = make_bridge()
+    controller = bridge.controllers[0]
+
+    bridge._apply_regs(controller, REGS_LINES)
+    assert f"{controller.key}_1" in bridge.zones
+
+    disabled_lines = [REGS_LINES[0], "1 | Room B | cur: 19.5 | tgt: 18.0 | DIS"]
+    bridge._apply_regs(controller, disabled_lines)
+
+    assert f"{controller.key}_1" not in bridge.zones
